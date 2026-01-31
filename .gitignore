@@ -1,0 +1,44 @@
+# 操作系统文件
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Python相关
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 虚拟环境
+venv/
+env/
+ENV/
+environment/
+
+# 项目特定
+.ipynb_checkpoints/
+data/dataset/
+logs/
+*.pth
+*.pt
+*.h5
+
+# IDE配置
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# 日志文件
+*.log
+*.log.*
+
+# 脚本输出
+test_output/
+train_output/
+
+# 其他临时文件
+*.tmp
+*.temp
+.cache/
