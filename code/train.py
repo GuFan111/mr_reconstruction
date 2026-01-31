@@ -22,16 +22,16 @@ from utils import convert_cuda, save_visualization_3view, simple_eval, gpu_slice
 # ==========================================
 class Config:
     name = 'dif_brats_prior'
-    data_root = r'/root/autodl-tmp/Proj/data/BraTS_128_Ready' 
+    data_root = r'D:\CODE\DaChuang\MR_Reconstruction\data\dataset\processed_npy'
     gpu_id = 0
     num_workers = 0 
-    preload = True   
-    batch_size = 4
+    preload = False
+    batch_size = 1
     epoch = 400
     lr = 1e-3
     num_views = 3
     out_res = 128
-    num_points = 10000
+    num_points = 3000
     combine = 'attention'
     eval_freq = 5
     save_freq = 1

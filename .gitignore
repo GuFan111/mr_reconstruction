@@ -18,11 +18,21 @@ environment/
 
 # 项目特定
 .ipynb_checkpoints/
-data/dataset/
-logs/
+
+# 数据文件
+# 只保留data/base/目录下的代码文件，忽略data/dataset/下的所有数据
+/data/dataset/
+/data/dataset.zip
+
+# 模型权重和检查点
 *.pth
 *.pt
 *.h5
+
+# 日志文件
+logs/
+*.log
+*.log.*
 
 # IDE配置
 .idea/
@@ -30,15 +40,11 @@ logs/
 *.sublime-project
 *.sublime-workspace
 
-# 日志文件
-*.log
-*.log.*
-
-# 脚本输出
-test_output/
-train_output/
-
-# 其他临时文件
+# 临时文件
 *.tmp
 *.temp
 .cache/
+
+# 脚本输出
+/test_output/
+/train_output/

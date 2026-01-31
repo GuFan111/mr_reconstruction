@@ -46,15 +46,28 @@ class BraTS_Dataset(Dataset):
 
         # 8:1:1 划分
         n = len(all_files)
-        if split == 'train':
-            self.file_list = all_files[:int(0.8 * n)]
-        elif split == 'eval':
-            self.file_list = all_files[int(0.8 * n):int(0.9 * n)]
+        if n < 3:
+            # 如果数据极少，则不进行严格划分，全部用于训练和验证
+            self.file_list = all_files
+            print(f"[{split}] Warning: Dataset too small ({n} files). Using all files for {split}.")
         else:
-            self.file_list = all_files[int(0.9 * n):]
+            train_end = int(0.8 * n)
+            eval_end = int(0.9 * n)
 
-        # print("单张图片过拟合测试 !!!")
-        # self.file_list = all_files[:1]
+            # 确保 eval 至少有一个文件
+            if train_end == eval_end and n >= 2:
+                eval_end = train_end + 1
+
+            if split == 'train':
+                self.file_list = all_files[:train_end]
+            elif split == 'eval':
+                self.file_list = all_files[train_end:eval_end]
+            else:
+                self.file_list = all_files[eval_end:]
+
+        # 如果划分后依然为空（例如只有1个文件且请求eval），强制给它分配一个
+        if len(self.file_list) == 0:
+            self.file_list = [all_files[-1]]
 
         print(f"[{split}] Dataset loaded. Found {len(self.file_list)} pre-processed files.")
 
