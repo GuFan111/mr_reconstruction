@@ -18,6 +18,7 @@ def convert_cuda(item):
             item[key] = item[key].float().cuda(non_blocking=True)
     return item
 
+
 def save_nifti(image, path):
     out = sitk.GetImageFromArray(image)
     sitk.WriteImage(out, path)
@@ -58,14 +59,12 @@ def save_visualization_3view(model, dataset, epoch, device='cuda', save_dir='vis
     model.eval()
     os.makedirs(save_dir, exist_ok=True)
 
-    # 1. Get non-cubic resolution
+    # 1. 获取非立方体分辨率信息
     res_x, res_y, res_z = dataset.out_res
     idx_x, idx_y, idx_z = res_x // 2, res_y // 2, res_z // 2
-
-    # Normalize coordinate fixed values
     fix_x, fix_y, fix_z = idx_x/(res_x-1), idx_y/(res_y-1), idx_z/(res_z-1)
 
-    # Generate sampling grids (Must strictly match training logic)
+    # 2. 生成采样网格
     ax_x, ax_y, ax_z = np.linspace(0, 1, res_x), np.linspace(0, 1, res_y), np.linspace(0, 1, res_z)
     u_ax, v_ax = np.meshgrid(ax_x, ax_y, indexing='ij')
     pts_ax = np.stack([u_ax, v_ax, np.ones_like(u_ax)*fix_z], axis=-1).reshape(-1, 3) # XY
@@ -77,7 +76,7 @@ def save_visualization_3view(model, dataset, epoch, device='cuda', save_dir='vis
     n_list = [len(pts_ax), len(pts_co), len(pts_sa)]
     all_points = np.concatenate([pts_ax, pts_co, pts_sa], axis=0).astype(np.float32)
 
-    # 2. Prepare data
+    # 3. 准备数据与推理
     data_item = dataset[0]
     name = data_item['name']
     vol_np = data_item['image'] # [1, X, Y, Z]
@@ -89,73 +88,103 @@ def save_visualization_3view(model, dataset, epoch, device='cuda', save_dir='vis
         prior_vol = prior_deformer(vol_cuda) if prior_deformer else vol_cuda
         prior_projs = gpu_slice_volume(prior_vol)
 
-        # 3. Inference
-    points_ts = torch.from_numpy((all_points - 0.5) * 2).unsqueeze(0).to(device)
-    proj_ts = torch.stack([points_ts[..., [0, 1]], points_ts[..., [0, 2]], points_ts[..., [1, 2]]], dim=1)
+        points_ts = torch.from_numpy((all_points - 0.5) * 2).unsqueeze(0).to(device)
+        proj_ts = torch.stack([points_ts[..., [0, 1]], points_ts[..., [0, 2]], points_ts[..., [1, 2]]], dim=1)
 
-    with torch.no_grad():
         input_dict = {'projs': projs, 'points': points_ts, 'proj_points': proj_ts, 'prior': prior_vol}
-        preds = model(input_dict, is_eval=True, eval_npoint=50000)
+        # 获取预测值和位移场
+        preds, deltas = model(input_dict, is_eval=True, eval_npoint=50000)
 
-        # Extract prediction results
+        # 4. 数据解构
     preds_raw = preds[0, 0].cpu().numpy()
-    imgs_pred = [
-        preds_raw[:n_list[0]].reshape(res_x, res_y),
-        preds_raw[n_list[0] : n_list[0]+n_list[1]].reshape(res_x, res_z),
-        preds_raw[n_list[0]+n_list[1] :].reshape(res_y, res_z)
-    ]
+    deltas_raw = deltas[0].cpu().numpy()
+    deform_mag = np.linalg.norm(deltas_raw, axis=0)
 
-    # 4. Extract GT and restore Input/Prior scale
+    view_resolutions = [(res_x, res_y), (res_x, res_z), (res_y, res_z)]
+    imgs_pred, imgs_deform, imgs_delta_v = [], [], []
+    curr = 0
+    for i, n in enumerate(n_list):
+        h_v, w_v = view_resolutions[i]
+        imgs_pred.append(preds_raw[curr:curr+n].reshape(h_v, w_v))
+        imgs_deform.append(deform_mag[curr:curr+n].reshape(h_v, w_v))
+        imgs_delta_v.append(deltas_raw[:, curr:curr+n].reshape(3, h_v, w_v))
+        curr += n
+
+    # 5. 提取 GT 并处理 Prior 缩放 (GT/Input 直接使用 gt_slices)
     vol = vol_np[0]
     gt_slices = [vol[:, :, idx_z], vol[:, idx_y, :], vol[idx_x, :, :]]
-
-    raw_input_np = projs[0, :, 0].cpu().numpy() # [3, res_max, res_max]
     raw_prior_np = prior_projs[0, :, 0].cpu().numpy()
 
-    imgs_input, imgs_prior = [], []
+    imgs_prior = []
     for i in range(3):
         h, w = gt_slices[i].shape
-        # Resize the square inputs back to the GT's actual height and width
-        imgs_input.append(cv2.resize(raw_input_np[i], (w, h), interpolation=cv2.INTER_LINEAR))
+        import cv2
         imgs_prior.append(cv2.resize(raw_prior_np[i], (w, h), interpolation=cv2.INTER_LINEAR))
 
-    # 5. Drawing
-    fig, axes = plt.subplots(3, 5, figsize=(15, 10))
+    # 6. 绘图 (调整为 3行5列)
+    fig, axes = plt.subplots(3, 5, figsize=(22, 12))
     titles = ['Axial', 'Coronal', 'Sagittal']
-    col_titles = ["GT", "Input", "Prior", "Recon", "Diff (x5)"]
+    # 合并后的列标题
+    col_titles = ["GT/Input", "Prior", "Recon", "Diff (x5)", "Deform Flow"]
 
     for i in range(3):
-        # We must use 'auto' aspect to prevent Matplotlib from forcing square pixels
+        # 动态计算位移上限，解决“一片蓝色”问题
+        local_vmax = max(0.01, np.percentile(imgs_deform[i], 98))
+        h_img, w_img = gt_slices[i].shape
+
         im_list = [
-            gt_slices[i],
-            imgs_input[i],
-            imgs_prior[i],
-            np.clip(imgs_pred[i], 0, 1),
-            np.abs(gt_slices[i] - np.clip(imgs_pred[i], 0, 1))
+            gt_slices[i],                      # Column 0: GT/Input 合并
+            imgs_prior[i],                     # Column 1: Prior
+            np.clip(imgs_pred[i], 0, 1),       # Column 2: Recon
+            np.abs(gt_slices[i] - np.clip(imgs_pred[i], 0, 1)) # Column 3: Diff
         ]
 
-        for j in range(5):
+        # 绘制前 4 列 (0-3)
+        for j in range(4):
             data_to_show = im_list[j].T
-            # Force vmin/vmax for Diff differently
-            v_max = 1.0 if j < 4 else 0.2
-            cmap = 'gray' if j < 4 else 'inferno'
-
-            # CRITICAL: aspect='auto' ensures the image fills the subplot regardless of ratio
+            v_max = 1.0 if j < 3 else 0.2
+            cmap = 'gray' if j < 3 else 'inferno'
             axes[i, j].imshow(data_to_show, cmap=cmap, vmin=0, vmax=v_max, origin='lower', aspect='auto')
 
+            # 补全所有列标题
             if i == 0:
-                axes[i, j].set_title(col_titles[j])
+                axes[i, j].set_title(col_titles[j], fontsize=14, fontweight='bold')
             axes[i, j].axis('off')
 
-        axes[i, 0].set_ylabel(titles[i])
-        # Re-enable the label since axis('off') hides it
-        axes[i, 0].text(-0.2, 0.5, titles[i], transform=axes[i, 0].transAxes,
-                        rotation=90, va='center', ha='center', fontsize=12, fontweight='bold')
+        # 第 5 列 (索引 4)：Deform Flow
+        ax = axes[i, 4]
+        extent = [0, w_img, 0, h_img]
+        # 背景叠加
+        ax.imshow(gt_slices[i].T, cmap='gray', alpha=0.8, origin='lower', aspect='auto', extent=extent)
+        ax.imshow(imgs_deform[i].T, cmap='jet', alpha=0.5, vmin=0, vmax=local_vmax, origin='lower', aspect='auto', extent=extent)
 
-    plt.tight_layout()
+        # 绘制稀疏矢量箭头
+        step = 16
+        y, x = np.mgrid[step//2:h_img:step, step//2:w_img:step]
+
+        if i == 0: # Axial
+            u, v = imgs_delta_v[i][0, ::step, ::step], imgs_delta_v[i][1, ::step, ::step]
+        elif i == 1: # Coronal
+            u, v = imgs_delta_v[i][0, ::step, ::step], imgs_delta_v[i][2, ::step, ::step]
+        else: # Sagittal
+            u, v = imgs_delta_v[i][1, ::step, ::step], imgs_delta_v[i][2, ::step, ::step]
+
+        ax.quiver(x, y, u.T, v.T, color='white', scale=1.0, width=0.005, alpha=0.9, pivot='mid')
+
+        if i == 0:
+            ax.set_title(col_titles[4], fontsize=14, fontweight='bold')
+        ax.axis('off')
+
+        # 修复：优化行标题偏移量，防止遮挡
+        axes[i, 0].text(-0.15, 0.5, titles[i], transform=axes[i, 0].transAxes,
+                        rotation=90, va='center', ha='center', fontsize=14, fontweight='bold')
+
+    # 修复：预留左侧 5% 的空间给行标题文字
+    plt.tight_layout(rect=[0.05, 0, 1, 1])
     save_path = os.path.join(save_dir, f'vis_ep{epoch}_{name}.png')
     plt.savefig(save_path, dpi=150)
     plt.close()
+    print(f"Merged visualization saved to {save_path}")
 
 
 def simple_eval(model, loader, npoint=50000):  # 每次评估每批计算50000个点
@@ -235,7 +264,7 @@ class ElasticDeformation(nn.Module):
     def __init__(self, grid_size=8, sigma=0.05):
         super().__init__()
         self.grid_size = grid_size # 形变频率
-        self.sigma = sigma         # 形变幅度 
+        self.sigma = sigma         # 形变幅度
 
     def forward(self, x):
         # x: [B, C, D, H, W]
