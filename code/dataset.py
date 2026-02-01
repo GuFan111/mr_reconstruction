@@ -29,22 +29,21 @@ class OrthogonalGeometry(object):
         return uv
 
 class BraTS_Dataset(Dataset):
-    def __init__(self, data_root, split='train', npoint=5000, out_res=128, preload=False):
+    def __init__(self, data_root, split='train', npoint=5000, out_res=(256,256,128), preload=False):
         super().__init__()
         self.data_root = data_root
         self.split = split
         self.npoint = npoint
-        self.out_res = out_res 
+        self.out_res = out_res
         self.geo = OrthogonalGeometry()
         self.preload = preload
         self.data_cache = []
 
         all_files = sorted(glob.glob(os.path.join(data_root, '*.npy')))
-        
-        if len(all_files) == 0:
-             raise RuntimeError(f"No .npy files found in {data_root}. Please run preprocess script first.")
 
-        # 8:1:1 划分
+        if len(all_files) == 0:
+            raise RuntimeError(f"No .npy files found in {data_root}. Please run preprocess script first.")
+
         n = len(all_files)
         if n < 3:
             # 如果数据极少，则不进行严格划分，全部用于训练和验证
@@ -79,13 +78,20 @@ class BraTS_Dataset(Dataset):
                 self.data_cache.append(vol)
 
         # 预生成评估网格
-        grid = np.mgrid[:out_res, :out_res, :out_res]
-        grid = grid.astype(float) / (out_res - 1) 
-        grid = grid.reshape(3, -1).transpose(1, 0)
-        self.eval_points = grid
+        res_x, res_y, res_z = out_res
+        grid = np.mgrid[:res_x, :res_y, :res_z]
+        # 归一化时需分别除以各自的分辨率
+        grid_norm = np.stack([
+            grid[0] / (res_x - 1),
+            grid[1] / (res_y - 1),
+            grid[2] / (res_z - 1)
+        ], axis=0)
+        grid_norm = grid_norm.reshape(3, -1).transpose(1, 0)
+        self.eval_points = grid_norm
 
     def __len__(self):
         return len(self.file_list)
+
 
     def __getitem__(self, index):
         # 1. 获取干净的 GT 数据 (Planning Scan)
@@ -97,55 +103,71 @@ class BraTS_Dataset(Dataset):
             name = os.path.basename(path).split('.')[0]
             vol_clean = np.load(path)
 
-        res = self.out_res
-        projs = np.zeros((3, 1, res, res), dtype=np.float32)
+        # --- 修改点 1: 解包非立方体分辨率 ---
+        # 假设 Config.out_res 现在是 (res_x, res_y, res_z)
+        res_x, res_y, res_z = self.out_res
+        res_max = max(res_x, res_y, res_z)
 
-        #  制作标签 (GT)
+        # projs 作为输入占位符，通常建议取最大维度以保证张量对齐
+        # 注意：后续 gpu_slice_volume 提取的切片若尺寸不同，可能需要填充（Padding）
+        projs = np.zeros((3, 1, res_max, res_max), dtype=np.float32)
+
+        # 制作标签 (GT)
         if self.split == 'train':
-            # 1. 找到所有非零区域（脑子）
+            # 1. 找到所有非零区域
             foreground_indices = np.argwhere(vol_clean > 1e-4)
-            
+
             if len(foreground_indices) > 0:
-                # 2. 采样策略：70% 脑子，30% 背景
+                # 2. 采样策略
                 n_fg = int(self.npoint * 0.7)
                 n_rnd = self.npoint - n_fg
-                
-                # A. 前景采样 (从 foreground_indices 里随机挑)
+
+                # A. 前景采样
                 choice_fg = np.random.choice(len(foreground_indices), n_fg, replace=True)
                 coords_fg = foreground_indices[choice_fg]
-                
-                # B. 背景/全局采样 (随机坐标)
-                coords_rnd = np.random.randint(0, self.out_res, (n_rnd, 3))
-                
+
+                # B. 背景/全局采样
+                # --- 修改点 2: 针对不同轴设置随机上限 ---
+                coords_rnd_x = np.random.randint(0, res_x, n_rnd)
+                coords_rnd_y = np.random.randint(0, res_y, n_rnd)
+                coords_rnd_z = np.random.randint(0, res_z, n_rnd)
+                coords_rnd = np.stack([coords_rnd_x, coords_rnd_y, coords_rnd_z], axis=1)
+
                 # C. 合并
                 coords = np.concatenate([coords_fg, coords_rnd], axis=0)
             else:
-                # 异常保护：如果是全黑图
-                coords = np.random.randint(0, self.out_res, (self.npoint, 3))
+                # 异常保护
+                coords_x = np.random.randint(0, res_x, self.npoint)
+                coords_y = np.random.randint(0, res_y, self.npoint)
+                coords_z = np.random.randint(0, res_z, self.npoint)
+                coords = np.stack([coords_x, coords_y, coords_z], axis=1)
 
             # 获取 GT 值
             values = vol_clean[coords[:, 0], coords[:, 1], coords[:, 2]]
-            
-            # 归一化坐标到 [0, 1] 供投影使用
-            points = coords.astype(np.float32) / (self.out_res - 1)
-        else:
-            # 全图评估
-            points = self.eval_points 
-            values = np.zeros(len(points)) 
 
-        # 5. 投影坐标
-        points_norm = (points - 0.5) * 2 
+            # --- 修改点 3: 坐标归一化 ---
+            # 必须分别除以对应轴的 (res - 1)
+            res_array = np.array([res_x, res_y, res_z], dtype=np.float32)
+            points = coords.astype(np.float32) / (res_array - 1)
+        else:
+            # 全图评估 (使用预生成的 eval_points，见下文 __init__ 修改)
+            points = self.eval_points
+            values = np.zeros(len(points))
+
+            # 5. 投影坐标
+        points_norm = (points - 0.5) * 2
         proj_points = []
         for i in range(3):
+            # 投影逻辑由 OrthogonalGeometry 处理
             proj_points.append(self.geo.project(points_norm, i))
-        proj_points = np.stack(proj_points, axis=0) 
+        proj_points = np.stack(proj_points, axis=0)
 
         return {
             'name': name,
             'dst_name': 'BraTS',
-            'projs': projs.astype(np.float32),          # Input (Noisy)
+            'projs': projs.astype(np.float32),
             'points': points_norm.astype(np.float32),
             'proj_points': proj_points.astype(np.float32),
-            'p_gt': values[None, :].astype(np.float32), # GT (Clean)
-            'image': vol_clean[None, ...]               # Vis (Clean)
+            'p_gt': values[None, :].astype(np.float32),
+            'image': vol_clean[None, ...]
         }

@@ -30,7 +30,7 @@ class Config:
     epoch = 400
     lr = 1e-3
     num_views = 3
-    out_res = 128
+    out_res = (256, 256, 128)
     num_points = 3000
     combine = 'attention'
     eval_freq = 5
