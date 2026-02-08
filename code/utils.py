@@ -38,7 +38,6 @@ def gpu_slice_volume(volume, slice_idx=None):
         idx_y = slice_idx[1] if isinstance(slice_idx, (tuple, list)) else Y // 2
         idx_z = slice_idx[2] if isinstance(slice_idx, (tuple, list)) else Z // 2
 
-    # --- 严格按照 dataset.py 的投影定义提取 ---
     # 1. Axial (XY平面): 固定 Z 轴 (dim 4)
     slice_ax = volume[:, :, :, :, idx_z]   # [B, 1, X, Y]
     # 2. Coronal (XZ平面): 固定 Y 轴 (dim 3)

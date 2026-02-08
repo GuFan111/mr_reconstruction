@@ -103,13 +103,10 @@ class BraTS_Dataset(Dataset):
             name = os.path.basename(path).split('.')[0]
             vol_clean = np.load(path)
 
-        # --- 修改点 1: 解包非立方体分辨率 ---
-        # 假设 Config.out_res 现在是 (res_x, res_y, res_z)
+        # 解包非立方体分辨率
         res_x, res_y, res_z = self.out_res
         res_max = max(res_x, res_y, res_z)
 
-        # projs 作为输入占位符，通常建议取最大维度以保证张量对齐
-        # 注意：后续 gpu_slice_volume 提取的切片若尺寸不同，可能需要填充（Padding）
         projs = np.zeros((3, 1, res_max, res_max), dtype=np.float32)
 
         # 制作标签 (GT)
@@ -145,12 +142,11 @@ class BraTS_Dataset(Dataset):
             # 获取 GT 值
             values = vol_clean[coords[:, 0], coords[:, 1], coords[:, 2]]
 
-            # --- 修改点 3: 坐标归一化 ---
-            # 必须分别除以对应轴的 (res - 1)
+            # 坐标归一化
             res_array = np.array([res_x, res_y, res_z], dtype=np.float32)
             points = coords.astype(np.float32) / (res_array - 1)
         else:
-            # 全图评估 (使用预生成的 eval_points，见下文 __init__ 修改)
+            # 全图评估
             points = self.eval_points
             values = np.zeros(len(points))
 

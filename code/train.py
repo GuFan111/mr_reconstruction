@@ -81,20 +81,16 @@ if __name__ == '__main__':
     # Simulator (Data Augmentation)
     # 噪声生成器
     train_simulator = GPUDailyScanSimulator(
-        # noise_level=0.1,
-        # blur_sigma=1.0
         noise_level=0.0,
         blur_sigma=0.0
     ).cuda()
 
     eval_simulator = GPUDailyScanSimulator(
-        # noise_level=0.1,
-        # blur_sigma=1.0
         noise_level=0.0,
         blur_sigma=0.0
     ).cuda()
 
-    # 形变生成器 (制造 Prior)
+    # 形变生成器
     prior_deformer = ElasticDeformation(grid_size=8, sigma=Config.sigma).cuda()
 
     optimizer = torch.optim.Adam(model.parameters(), lr=Config.lr, weight_decay=0)
@@ -175,16 +171,12 @@ if __name__ == '__main__':
                     torch.cuda.synchronize()
                     t_start = time.time()
 
-                    # --- 【关键修改点】 ---
-                    # 之前是 pred = model(...)
-                    # 现在需要接收两个返回值，我们用 _ 忽略不需要的位移场
                     pred, _ = model(v_item, is_eval=True, eval_npoint=50000)
 
                     torch.cuda.synchronize()
                     t_end = time.time()
                     inference_times.append(t_end - t_start)
 
-                    # 现在 pred 是 Tensor 对象，不再是元组，[0, 0] 索引将正常工作
                     pred = pred[0, 0].cpu().numpy().reshape(v_item['image'].shape[2:])
                     gt_img = v_item['image'].cpu().numpy()[0, 0]
 

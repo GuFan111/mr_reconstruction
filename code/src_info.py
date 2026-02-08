@@ -10,5 +10,5 @@ print(f"Origin: {reader.GetOrigin()}")
 print(f"Spacing: {reader.GetSpacing()}")
 print(f"Direction: {reader.GetDirection()}")
 
-# 查看特定的 DICOM 标签内容（例如 0008|0060 为 Modality）
+# 查看特定的 DICOM 标签内容
 print(f"设备类型: {reader.GetMetaData('0008|0060')}")
