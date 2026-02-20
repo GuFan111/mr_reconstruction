@@ -82,10 +82,15 @@ def save_visualization_3view(model, dataset, epoch, device='cuda', save_dir='vis
     vol_cuda = torch.from_numpy(vol_np).unsqueeze(0).to(device)
 
     with torch.no_grad():
-        noisy_vol = simulator(vol_cuda) if simulator else vol_cuda
-        projs = gpu_slice_volume(noisy_vol)
-        prior_vol = prior_deformer(vol_cuda) if prior_deformer else vol_cuda
+        # 🟢 逻辑翻转
+        prior_vol = vol_cuda
         prior_projs = gpu_slice_volume(prior_vol)
+
+        # 形变产生真实 Target
+        target_vol = prior_deformer(prior_vol, mode='bilinear') if prior_deformer else prior_vol
+
+        noisy_vol = simulator(target_vol) if simulator else target_vol
+        projs = gpu_slice_volume(noisy_vol)
 
         points_ts = torch.from_numpy((all_points - 0.5) * 2).unsqueeze(0).to(device)
         proj_ts = torch.stack([points_ts[..., [0, 1]], points_ts[..., [0, 2]], points_ts[..., [1, 2]]], dim=1)
@@ -94,7 +99,7 @@ def save_visualization_3view(model, dataset, epoch, device='cuda', save_dir='vis
         # 获取预测值和位移场
         preds, deltas = model(input_dict, is_eval=True, eval_npoint=50000)
 
-        # 4. 数据解构
+    # 4. 数据解构
     preds_raw = preds[0, 0].cpu().numpy()
     deltas_raw = deltas[0].cpu().numpy()
     deform_mag = np.linalg.norm(deltas_raw, axis=0)
@@ -109,9 +114,11 @@ def save_visualization_3view(model, dataset, epoch, device='cuda', save_dir='vis
         imgs_delta_v.append(deltas_raw[:, curr:curr+n].reshape(3, h_v, w_v))
         curr += n
 
-    # 5. 提取 GT 并处理 Prior 缩放 (GT/Input 直接使用 gt_slices)
-    vol = vol_np[0]
-    gt_slices = [vol[:, :, idx_z], vol[:, idx_y, :], vol[idx_x, :, :]]
+    # 5. 提取 GT 并处理 Prior 缩放
+    # 🟢 修正：GT 切片必须从 target_vol 中提取
+    target_vol_np = target_vol[0, 0].cpu().numpy()
+    gt_slices = [target_vol_np[:, :, idx_z], target_vol_np[:, idx_y, :], target_vol_np[idx_x, :, :]]
+
     raw_prior_np = prior_projs[0, :, 0].cpu().numpy()
 
     imgs_prior = []
@@ -120,32 +127,41 @@ def save_visualization_3view(model, dataset, epoch, device='cuda', save_dir='vis
         import cv2
         imgs_prior.append(cv2.resize(raw_prior_np[i], (w, h), interpolation=cv2.INTER_LINEAR))
 
-    # 6. 绘图 (调整为 3行5列)
+    # 6. 绘图 (完全保留你引入的自动对比度拉伸)
     fig, axes = plt.subplots(3, 5, figsize=(22, 12))
     titles = ['Axial', 'Coronal', 'Sagittal']
-    # 合并后的列标题
     col_titles = ["GT/Input", "Prior", "Recon", "Diff (x5)", "Deform Flow"]
 
     for i in range(3):
-        # 动态计算位移上限，解决“一片蓝色”问题
+        # 动态计算位移上限
         local_vmax = max(0.01, np.percentile(imgs_deform[i], 98))
         h_img, w_img = gt_slices[i].shape
 
+        # --- 对比度增强核心逻辑 ---
+        # 即使数据已经是 0-1 归一化的，由于 MRI 的特性，软组织往往偏暗。
+        # 我们计算第 2% 和第 98% 分位数，将其拉伸到 0-1 范围。
+        def enhance_contrast(img):
+            p2, p98 = np.percentile(img, [2, 98])
+            # 防止分母为 0
+            img_adj = np.clip((img - p2) / (p98 - p2 + 1e-8), 0, 1)
+            # 加上一点伽马校正，让暗部细节更深邃
+            return np.power(img_adj, 0.9)
+
         im_list = [
-            gt_slices[i],                      # Column 0: GT/Input 合并
-            imgs_prior[i],                     # Column 1: Prior
-            np.clip(imgs_pred[i], 0, 1),       # Column 2: Recon
-            np.abs(gt_slices[i] - np.clip(imgs_pred[i], 0, 1)) # Column 3: Diff
+            enhance_contrast(gt_slices[i]),            # 增强后的 GT
+            enhance_contrast(imgs_prior[i]),           # 增强后的 Prior
+            enhance_contrast(np.clip(imgs_pred[i], 0, 1)), # 增强后的 Recon
+            np.abs(gt_slices[i] - np.clip(imgs_pred[i], 0, 1)) # Diff 保持原始比例
         ]
 
-        # 绘制前 4 列 (0-3)
+        # 绘制前 4 列
         for j in range(4):
             data_to_show = im_list[j].T
+            # 因为已经在上面 enhance_contrast 过了，这里 vmax 统一用 1.0 即可
             v_max = 1.0 if j < 3 else 0.2
             cmap = 'gray' if j < 3 else 'inferno'
             axes[i, j].imshow(data_to_show, cmap=cmap, vmin=0, vmax=v_max, origin='lower', aspect='auto')
 
-            # 补全所有列标题
             if i == 0:
                 axes[i, j].set_title(col_titles[j], fontsize=14, fontweight='bold')
             axes[i, j].axis('off')
@@ -260,40 +276,51 @@ class GPUDailyScanSimulator(nn.Module):
 
 # 模拟形变
 class ElasticDeformation(nn.Module):
-    def __init__(self, grid_size=8, sigma=0.05):
+    def __init__(self, grid_size=8, sigma=(0.02, 0.02, 0.08)):
         super().__init__()
         self.grid_size = grid_size # 形变频率
-        self.sigma = sigma         # 形变幅度
+        # sigma 支持 float (各向同性) 或 tuple (sigma_x, sigma_y, sigma_z) (各向异性)
+        self.sigma = sigma
 
-    def forward(self, x):
-        # x: [B, C, D, H, W]
+    def forward(self, x, mode='bilinear'):
+        # x: [B, C, D, H, W] -> 对应物理空间的 [B, C, X, Y, Z]
         B, C, D, H, W = x.shape
         device = x.device
 
         # 1. 生成低分辨率的随机位移场
-        # shape: [B, 3, grid, grid, grid]
-        flow_coarse = torch.randn(B, 3, self.grid_size, self.grid_size, self.grid_size, device=device) * self.sigma
+        if isinstance(self.sigma, (list, tuple)):
+            assert len(self.sigma) == 3, "Sigma must be a sequence of 3 floats: (sigma_x, sigma_y, sigma_z)"
+            sigma_x, sigma_y, sigma_z = self.sigma
+
+            # 🟢 物理映射对齐：
+            # grid_sample 需要的顺序是 (W, H, D) -> 对应 (Z, Y, X)
+            # 所以 Channel 0 修改 Z 轴, Channel 1 修改 Y 轴, Channel 2 修改 X 轴
+            flow_z = torch.randn(B, 1, self.grid_size, self.grid_size, self.grid_size, device=device) * sigma_z
+            flow_y = torch.randn(B, 1, self.grid_size, self.grid_size, self.grid_size, device=device) * sigma_y
+            flow_x = torch.randn(B, 1, self.grid_size, self.grid_size, self.grid_size, device=device) * sigma_x
+            flow_coarse = torch.cat([flow_z, flow_y, flow_x], dim=1)
+        else:
+            flow_coarse = torch.randn(B, 3, self.grid_size, self.grid_size, self.grid_size, device=device) * self.sigma
 
         # 2. 上采样到全分辨率
-        # grid_sample 需要的 flow 必须与 input 尺寸一致
         flow = F.interpolate(flow_coarse, size=(D, H, W), mode='trilinear', align_corners=True)
         # flow shape: [B, 3, D, H, W] -> permute to [B, D, H, W, 3] for grid_sample
         flow = flow.permute(0, 2, 3, 4, 1)
 
         # 3. 生成基础网格
-        # grid: [1, D, H, W, 3]
         d = torch.linspace(-1, 1, D, device=device)
         h = torch.linspace(-1, 1, H, device=device)
         w = torch.linspace(-1, 1, W, device=device)
         grid_d, grid_h, grid_w = torch.meshgrid(d, h, w, indexing='ij')
-        base_grid = torch.stack([grid_w, grid_h, grid_d], dim=-1).unsqueeze(0) # 注意: grid_sample 顺序是 x,y,z (W,H,D)
+
+        # 🟢 注意这里的 stack 顺序: W(Z), H(Y), D(X)
+        base_grid = torch.stack([grid_w, grid_h, grid_d], dim=-1).unsqueeze(0)
 
         # 4. 叠加形变
-        # base_grid + flow
         final_grid = base_grid + flow
 
-        # 5. 采样得到变形后的 Volume
-        deformed_x = F.grid_sample(x, final_grid, mode='bilinear', padding_mode='reflection', align_corners=True)
+        # 5. 采样得到变形后的 Volume (兼容 Mask 的 nearest 插值)
+        deformed_x = F.grid_sample(x, final_grid, mode=mode, padding_mode='reflection', align_corners=True)
 
         return deformed_x
 

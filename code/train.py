@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 import logging
 
-from dataset import BraTS_Dataset
+from dataset import AMOS_Dataset
 from models.model import DIF_Net
 from utils import convert_cuda, save_visualization_3view, simple_eval, gpu_slice_volume, GPUDailyScanSimulator, ElasticDeformation, simple_eval_metric, compute_gradient
 
@@ -21,23 +21,26 @@ from utils import convert_cuda, save_visualization_3view, simple_eval, gpu_slice
 #  配置区域
 # ==========================================
 class Config:
-    name = 'dif_brats_prior'
-    data_root = r'/root/autodl-tmp/Proj/data/processed_npy/'
+    name = 'dif_amos_roi_v2' # 建议改名以区分旧实验
+    # 指向你刚才预处理后的数据盘路径
+    data_root = r'/root/autodl-tmp/Proj/data/amos_mri_npy'
+    # 新增：指向你生成的 ROI JSON 文件夹
+    label_root = r'/root/autodl-tmp/Proj/data/amos_mri_label_npy'
+
     gpu_id = 0
-    num_workers = 0
-    preload = False
+    num_workers = 22 # 配合数据盘读取，不需要设置过大
+    preload = False # 如果内存不够（系统盘爆过），建议设为 False
     batch_size = 1
     epoch = 400
     lr = 1e-3
     num_views = 3
     out_res = (256, 256, 128)
-    num_points = 100000
+    num_points = 100000 # 配合 ROI 采样，10w 点就能达到很好的效果
     combine = 'attention'
-    eval_freq = 50
-    save_freq = 200
-    check_freq = 1000
+    eval_freq = 10
+    save_freq = 50
     gamma = 0.95
-    sigma = 0.05
+    sigma = (0.02, 0.02, 0.08)
 
 
 def worker_init_fn(worker_id):
@@ -68,11 +71,31 @@ if __name__ == '__main__':
     logger.info(f"Start training: {Config.name}")
     logger.info(f"Config: Batch={Config.batch_size}, LR={Config.lr}, Sigma={Config.sigma}")
 
-    # Dataset & Loader
-    train_dst = BraTS_Dataset(data_root=Config.data_root, split='train', npoint=Config.num_points, out_res=Config.out_res, preload=Config.preload)
-    train_loader = DataLoader(train_dst, batch_size=Config.batch_size, shuffle=True, num_workers=0 if Config.preload else 4, pin_memory=True, worker_init_fn=worker_init_fn)
+    train_dst = AMOS_Dataset(
+        data_root=Config.data_root,
+        label_root=Config.label_root,
+        split='train',
+        npoint=Config.num_points,
+        out_res=Config.out_res
+    )
+    # 如果 preload=False，建议设置 num_workers 开启多线程读取
+    train_loader = DataLoader(
+        train_dst,
+        batch_size=Config.batch_size,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        worker_init_fn=worker_init_fn
+    )
 
-    val_dst = BraTS_Dataset(data_root=Config.data_root, split='eval', npoint=100000, out_res=Config.out_res, preload=Config.preload)
+    val_dst = AMOS_Dataset(
+        data_root=Config.data_root,
+        label_root=Config.label_root,
+        split='eval',
+        npoint=50000, # 评估时采样点可以少一点
+        out_res=Config.out_res
+    )
+
     eval_loader = DataLoader(val_dst, batch_size=1, shuffle=False)
 
     # Model
@@ -90,8 +113,7 @@ if __name__ == '__main__':
         blur_sigma=0.0
     ).cuda()
 
-    # 形变生成器
-    prior_deformer = ElasticDeformation(grid_size=8, sigma=Config.sigma).cuda()
+    deformer = ElasticDeformation(grid_size=8, sigma=Config.sigma).cuda()
 
     optimizer = torch.optim.Adam(model.parameters(), lr=Config.lr, weight_decay=0)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=Config.gamma)
@@ -107,13 +129,20 @@ if __name__ == '__main__':
                 optimizer.zero_grad()
                 item = convert_cuda(item)
 
-                # GT Volume
-                raw_vol = item['image']
-
                 with torch.no_grad():
-                    item['projs'] = gpu_slice_volume(raw_vol)
-                    item['prior'] = prior_deformer(raw_vol)
-                    gt = item['p_gt']
+                    # 🟢 逻辑翻转：源图像作为 Prior，形变产生 Target
+                    prior_vol = item['image']
+                    target_vol = deformer(prior_vol, mode='bilinear')
+
+                    # 🟢 从 Target 中切片并更新输入
+                    item['projs'] = gpu_slice_volume(target_vol)
+                    item['prior'] = prior_vol
+
+                    # 🟢 动态重新采样 GT，因为真实的物理状态 (Target) 已经改变
+                    uv = item['points']
+                    uv_sampling = uv[..., [2, 1, 0]].reshape(uv.shape[0], 1, 1, uv.shape[1], 3)
+                    gt = F.grid_sample(target_vol, uv_sampling, align_corners=True)[:, :, 0, 0, :]
+                    item['p_gt'] = gt
 
                 pred_val, delta_coords = model(item)
 
@@ -128,7 +157,7 @@ if __name__ == '__main__':
                 loss_reg = torch.mean(delta_coords ** 2)
 
                 # 总 Loss
-                w_reg = 0.01
+                w_reg = 0.02
                 loss = loss_recon + w_reg * loss_reg
                 loss_list.append(loss.item())
                 loss.backward()
@@ -139,7 +168,7 @@ if __name__ == '__main__':
                 current_lr = optimizer.param_groups[0]["lr"]
                 pbar.set_postfix({'loss': f'{np.mean(loss_list):.6f}', 'lr': f'{current_lr:.6f}'})
 
-            logger.info(f"Epoch {epoch} | Train Loss: {np.mean(loss_list):.6f} | LR: {current_lr:.2e}")
+        logger.info(f"Epoch {epoch} | Train Loss: {np.mean(loss_list):.6f} | LR: {current_lr:.2e}")
 
 
         if epoch > 0 and epoch % Config.save_freq == 0:
@@ -154,7 +183,7 @@ if __name__ == '__main__':
                 model, val_dst, epoch,
                 save_dir=os.path.join(save_dir, 'vis'),
                 simulator=eval_simulator,
-                prior_deformer=prior_deformer  # 传入形变器
+                prior_deformer=deformer  # 传入修改后的形变器
             )
 
             model.eval()
@@ -165,8 +194,13 @@ if __name__ == '__main__':
                 for i, v_item in enumerate(eval_loader):
                     if i>=5: break
                     v_item = convert_cuda(v_item)
-                    v_item['projs'] = gpu_slice_volume(v_item['image'])
-                    v_item['prior'] = prior_deformer(v_item['image'])  # 变形 prior
+
+                    # 🟢 评估阶段逻辑翻转
+                    prior_vol = v_item['image']
+                    target_vol = deformer(prior_vol, mode='bilinear')
+
+                    v_item['projs'] = gpu_slice_volume(target_vol)
+                    v_item['prior'] = prior_vol
 
                     torch.cuda.synchronize()
                     t_start = time.time()
@@ -178,7 +212,8 @@ if __name__ == '__main__':
                     inference_times.append(t_end - t_start)
 
                     pred = pred[0, 0].cpu().numpy().reshape(v_item['image'].shape[2:])
-                    gt_img = v_item['image'].cpu().numpy()[0, 0]
+                    # 🟢 SSIM 的基准对象必须是 Target
+                    gt_img = target_vol.cpu().numpy()[0, 0]
 
                     # 背景滤除
                     # pred[pred < 0.05] = 0
