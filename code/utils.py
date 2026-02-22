@@ -82,12 +82,30 @@ def save_visualization_3view(model, dataset, epoch, device='cuda', save_dir='vis
     vol_cuda = torch.from_numpy(vol_np).unsqueeze(0).to(device)
 
     with torch.no_grad():
-        # 🟢 逻辑翻转
         prior_vol = vol_cuda
         prior_projs = gpu_slice_volume(prior_vol)
 
-        # 形变产生真实 Target
-        target_vol = prior_deformer(prior_vol, mode='bilinear') if prior_deformer else prior_vol
+        # ==========================================
+        # 🟢 植入时间静止魔法：保证可视化和 Eval 算指标用的是同一个形变场！
+        # ==========================================
+        if prior_deformer:
+            cpu_rng_state = torch.get_rng_state()
+            gpu_rng_state = torch.cuda.get_rng_state()
+
+            # 因为可视化固定画的是 dataset[0] (也就是 i=0)，所以 seed 必须是 2026 + 0
+            fixed_seed = 2026
+            torch.manual_seed(fixed_seed)
+            torch.cuda.manual_seed(fixed_seed)
+
+            # 宿命形变
+            target_vol = prior_deformer(prior_vol, mode='bilinear')
+
+            # 恢复时间的流动
+            torch.set_rng_state(cpu_rng_state)
+            torch.cuda.set_rng_state(gpu_rng_state)
+        else:
+            target_vol = prior_vol
+        # ==========================================
 
         noisy_vol = simulator(target_vol) if simulator else target_vol
         projs = gpu_slice_volume(noisy_vol)
@@ -338,4 +356,3 @@ def compute_gradient(img):
     grad_x = img[..., 1:, :] - img[..., :-1, :]
     grad_y = img[..., :, 1:] - img[..., :, :-1]
     return grad_x, grad_y
-

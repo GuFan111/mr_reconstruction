@@ -19,10 +19,10 @@ class OrthogonalGeometry(object):
         return uv
 
 class AMOS_Dataset(Dataset):
-    def __init__(self, data_root, json_root, split='train', npoint=5000, out_res=(256, 256, 128), preload=False):
+    def __init__(self, data_root, label_root, split='train', npoint=5000, out_res=(256, 256, 128), preload=False):
         super().__init__()
         self.data_root = data_root
-        self.json_root = json_root # 你需要这个目录来存放器官坐标
+        self.label_root = label_root # 你需要这个目录来存放器官坐标
         self.split = split
         self.npoint = npoint
         self.out_res = out_res
@@ -73,7 +73,7 @@ class AMOS_Dataset(Dataset):
 
         # --- 修改 2: 引入 ROI 引导采样 ---
         if self.split == 'train':
-            json_path = os.path.join(self.json_root, f"{name}.json")
+            json_path = os.path.join(self.label_root, f"{name}.json")
             if os.path.exists(json_path):
                 with open(json_path, 'r') as f:
                     roi = json.load(f)
@@ -110,11 +110,20 @@ class AMOS_Dataset(Dataset):
             self.geo.project(points_norm, 2)
         ], axis=0)
 
+        label_path = os.path.join(self.label_root, f"{name}_label.npy")
+
+        if os.path.exists(label_path):
+            mask_np = np.load(label_path)
+        else:
+            print(f"\n[CRITICAL FATAL] 找不到标签文件: {label_path}")
+            mask_np = np.zeros_like(vol_clean) # 兜底
+
         return {
             'name': name,
             'projs': projs,
             'points': points_norm.astype(np.float32),
             'proj_points': proj_points.astype(np.float32),
             'p_gt': values[None, :].astype(np.float32),
-            'image': vol_clean[None, ...]
+            'image': vol_clean[None, ...],
+            'mask': mask_np[None, ...]  # 🟢 把 mask 传出来
         }
