@@ -63,7 +63,7 @@ class AMOS_Dataset(Dataset):
 
         res_x, res_y, res_z = self.out_res
 
-        # 2. 🟢 【核心修改】提前加载 Mask 标签！
+        # 2. 提前加载 Mask 标签
         label_path = os.path.join(self.label_root, f"{name}_label.npy")
         if os.path.exists(label_path):
             mask_np = np.load(label_path)
@@ -71,26 +71,18 @@ class AMOS_Dataset(Dataset):
             print(f"\n[CRITICAL FATAL] 找不到标签文件: {label_path}")
             mask_np = np.zeros_like(vol_clean) # 兜底
 
-        # 3. 模拟 MR-Linac 的三帧投影 (MIP)
         res_max = max(res_x, res_y, res_z)
         projs = np.zeros((3, 1, res_max, res_max), dtype=np.float32)
-        projs[0, 0, :res_x, :res_y] = np.max(vol_clean, axis=2)
-        projs[1, 0, :res_x, :res_z] = np.max(vol_clean, axis=1)
-        projs[2, 0, :res_y, :res_z] = np.max(vol_clean, axis=0)
 
-        # 4. 🟢 实时动态靶区计算 (彻底抛弃 JSON)
+        # 4. 实时动态靶区计算 (ROI 暴力聚焦)
         if self.split == 'train':
-            # 直接从 Mask 中寻找肝脏的物理坐标 (假设 mask_np 中 > 0 的就是肝脏)
             nz = np.argwhere(mask_np > 0)
-
             if len(nz) > 0:
-                # 动态获取 Z, Y, X (或 X, Y, Z，取决于 Numpy 存储顺序) 的极值
                 mins = nz.min(axis=0)
                 maxs = nz.max(axis=0)
 
-                margin = 15 # 15 个体素的脂肪缓冲带
+                margin = 15 # 脂肪缓冲带
 
-                # 安全截断，防止越界
                 min_0 = max(0, mins[0] - margin)
                 max_0 = min(vol_clean.shape[0], maxs[0] + margin)
                 min_1 = max(0, mins[1] - margin)
@@ -98,14 +90,13 @@ class AMOS_Dataset(Dataset):
                 min_2 = max(0, mins[2] - margin)
                 max_2 = min(vol_clean.shape[2], maxs[2] + margin)
 
-                # 100% 算力死死锁在膨胀靶区内！
+                # 100% 算力死死锁在膨胀靶区内
                 coords = np.stack([
                     np.random.randint(min_0, max_0, self.npoint),
                     np.random.randint(min_1, max_1, self.npoint),
                     np.random.randint(min_2, max_2, self.npoint)
                 ], axis=1)
             else:
-                # 极端异常兜底：如果这张切片里完全没有肝脏
                 coords = np.stack([
                     np.random.randint(0, res_x, self.npoint),
                     np.random.randint(0, res_y, self.npoint),
@@ -120,6 +111,7 @@ class AMOS_Dataset(Dataset):
         res_array = np.array([res_x, res_y, res_z], dtype=np.float32)
         points_norm = ((coords.astype(np.float32) / (res_array - 1)) - 0.5) * 2
 
+        # 投影坐标映射
         proj_points = np.stack([
             self.geo.project(points_norm, 0),
             self.geo.project(points_norm, 1),
@@ -128,7 +120,7 @@ class AMOS_Dataset(Dataset):
 
         return {
             'name': name,
-            'projs': projs,
+            'projs': projs,  # 传递空壳占位符
             'points': points_norm.astype(np.float32),
             'proj_points': proj_points.astype(np.float32),
             'p_gt': values[None, :].astype(np.float32),

@@ -43,8 +43,8 @@ class Config:
     eval_freq = 10
     save_freq = 50
     gamma = 0.95
-    # sigma = (0.02, 0.02, 0.08)
-    sigma = (0.0, 0.0, 0.0)
+    sigma = (0.02, 0.02, 0.08)
+    # sigma = (0.0, 0.0, 0.0)
 
 
 
