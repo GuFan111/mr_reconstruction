@@ -52,7 +52,7 @@ class AMOS_Dataset(Dataset):
         return grid.reshape(3, -1).transpose(1, 0) # [N, 3]
 
     def __getitem__(self, index):
-        # 1. 加载数据
+        # 1. 加载图像数据
         if self.preload:
             vol_clean = self.data_cache[index]
             name = os.path.basename(self.file_list[index]).split('.')[0]
@@ -63,43 +63,59 @@ class AMOS_Dataset(Dataset):
 
         res_x, res_y, res_z = self.out_res
 
-        # --- 修改 1: 模拟 MR-Linac 的三帧投影 (MIP) ---
-        # 即使是训练，也需要给模型“看”投影图，否则注意力无法对焦
+        # 2. 🟢 【核心修改】提前加载 Mask 标签！
+        label_path = os.path.join(self.label_root, f"{name}_label.npy")
+        if os.path.exists(label_path):
+            mask_np = np.load(label_path)
+        else:
+            print(f"\n[CRITICAL FATAL] 找不到标签文件: {label_path}")
+            mask_np = np.zeros_like(vol_clean) # 兜底
+
+        # 3. 模拟 MR-Linac 的三帧投影 (MIP)
         res_max = max(res_x, res_y, res_z)
         projs = np.zeros((3, 1, res_max, res_max), dtype=np.float32)
-        projs[0, 0, :res_x, :res_y] = np.max(vol_clean, axis=2) # Axial
-        projs[1, 0, :res_x, :res_z] = np.max(vol_clean, axis=1) # Coronal
-        projs[2, 0, :res_y, :res_z] = np.max(vol_clean, axis=0) # Sagittal
+        projs[0, 0, :res_x, :res_y] = np.max(vol_clean, axis=2)
+        projs[1, 0, :res_x, :res_z] = np.max(vol_clean, axis=1)
+        projs[2, 0, :res_y, :res_z] = np.max(vol_clean, axis=0)
 
-        # --- 修改 2: 引入 ROI 引导采样 ---
+        # 4. 🟢 实时动态靶区计算 (彻底抛弃 JSON)
         if self.split == 'train':
-            json_path = os.path.join(self.label_root, f"{name}.json")
-            if os.path.exists(json_path):
-                with open(json_path, 'r') as f:
-                    roi = json.load(f)
-                # 70% 的点落在器官框内，解决“糊”的关键
-                n_roi = int(self.npoint * 0.7)
-                coords_roi = np.stack([
-                    np.random.randint(roi['mins'][0], roi['maxs'][0], n_roi),
-                    np.random.randint(roi['mins'][1], roi['maxs'][1], n_roi),
-                    np.random.randint(roi['mins'][2], roi['maxs'][2], n_roi)
-                ], axis=1)
-                # 30% 全局随机
-                coords_rnd = np.stack([
-                    np.random.randint(0, res_x, self.npoint - n_roi),
-                    np.random.randint(0, res_y, self.npoint - n_roi),
-                    np.random.randint(0, res_z, self.npoint - n_roi)
-                ], axis=1)
-                coords = np.concatenate([coords_roi, coords_rnd], axis=0)
-            else:
-                # 备份：如果没 JSON，用你原来的 > 1e-4 逻辑
-                fg_idx = np.argwhere(vol_clean > 0.1)
-                coords = fg_idx[np.random.choice(len(fg_idx), self.npoint)]
-        else:
-            # 推理模式：全图网格采样 (维持你原来的 eval_points 逻辑)
-            coords = self.eval_points_as_indices() # 假设你生成的索引
+            # 直接从 Mask 中寻找肝脏的物理坐标 (假设 mask_np 中 > 0 的就是肝脏)
+            nz = np.argwhere(mask_np > 0)
 
-        # --- 修改 3: 物理空间归一化 ---
+            if len(nz) > 0:
+                # 动态获取 Z, Y, X (或 X, Y, Z，取决于 Numpy 存储顺序) 的极值
+                mins = nz.min(axis=0)
+                maxs = nz.max(axis=0)
+
+                margin = 15 # 15 个体素的脂肪缓冲带
+
+                # 安全截断，防止越界
+                min_0 = max(0, mins[0] - margin)
+                max_0 = min(vol_clean.shape[0], maxs[0] + margin)
+                min_1 = max(0, mins[1] - margin)
+                max_1 = min(vol_clean.shape[1], maxs[1] + margin)
+                min_2 = max(0, mins[2] - margin)
+                max_2 = min(vol_clean.shape[2], maxs[2] + margin)
+
+                # 100% 算力死死锁在膨胀靶区内！
+                coords = np.stack([
+                    np.random.randint(min_0, max_0, self.npoint),
+                    np.random.randint(min_1, max_1, self.npoint),
+                    np.random.randint(min_2, max_2, self.npoint)
+                ], axis=1)
+            else:
+                # 极端异常兜底：如果这张切片里完全没有肝脏
+                coords = np.stack([
+                    np.random.randint(0, res_x, self.npoint),
+                    np.random.randint(0, res_y, self.npoint),
+                    np.random.randint(0, res_z, self.npoint)
+                ], axis=1)
+        else:
+            # 推理模式：全图网格采样
+            coords = self.eval_points_as_indices()
+
+            # 5. 物理空间归一化 [-1, 1]
         values = vol_clean[coords[:, 0], coords[:, 1], coords[:, 2]]
         res_array = np.array([res_x, res_y, res_z], dtype=np.float32)
         points_norm = ((coords.astype(np.float32) / (res_array - 1)) - 0.5) * 2
@@ -110,14 +126,6 @@ class AMOS_Dataset(Dataset):
             self.geo.project(points_norm, 2)
         ], axis=0)
 
-        label_path = os.path.join(self.label_root, f"{name}_label.npy")
-
-        if os.path.exists(label_path):
-            mask_np = np.load(label_path)
-        else:
-            print(f"\n[CRITICAL FATAL] 找不到标签文件: {label_path}")
-            mask_np = np.zeros_like(vol_clean) # 兜底
-
         return {
             'name': name,
             'projs': projs,
@@ -125,5 +133,5 @@ class AMOS_Dataset(Dataset):
             'proj_points': proj_points.astype(np.float32),
             'p_gt': values[None, :].astype(np.float32),
             'image': vol_clean[None, ...],
-            'mask': mask_np[None, ...]  # 🟢 把 mask 传出来
+            'mask': mask_np[None, ...]
         }

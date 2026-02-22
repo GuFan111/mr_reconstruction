@@ -28,13 +28,14 @@ class Config:
     # 指向你刚才预处理后的数据盘路径
     data_root = r'/root/autodl-tmp/Proj/data/amos_mri_npy'
     label_root = r'/root/autodl-tmp/Proj/data/amos_mri_label_npy'
-    resume_path = r;
+    # resume_path = r'/root/autodl-tmp/Proj/code/logs/dif_amos_roi_v2/ep_100.pth'
+    resume_path = None
     gpu_id = 0
     num_workers = 22 # 配合数据盘读取，不需要设置过大
     preload = False # 如果内存不够（系统盘爆过），建议设为 False
     batch_size = 1
     epoch = 400
-    lr = 1e-3
+    lr = 5e-4
     num_views = 3
     out_res = (256, 256, 128)
     num_points = 100000 # 配合 ROI 采样，10w 点就能达到很好的效果
@@ -42,8 +43,8 @@ class Config:
     eval_freq = 10
     save_freq = 50
     gamma = 0.95
-    sigma = (0.02, 0.02, 0.08)
-    # sigma = (0.0, 0.0, 0.0)
+    # sigma = (0.02, 0.02, 0.08)
+    sigma = (0.0, 0.0, 0.0)
 
 
 
@@ -105,6 +106,8 @@ if __name__ == '__main__':
     # 1. 实例化模型与优化器
     model = DIF_Net(num_views=Config.num_views, combine=Config.combine).cuda()
     optimizer = torch.optim.Adam(model.parameters(), lr=Config.lr, weight_decay=0)
+    for group in optimizer.param_groups:
+        group.setdefault('initial_lr', Config.lr)
 
     # 2. 🟢 解析断点续训 (优先于调度器初始化)
     start_epoch = 0
@@ -168,35 +171,25 @@ if __name__ == '__main__':
                     item['p_gt'] = gt
 
                 # ==========================================
-                # 🟢 阶段 3: ROI 强权 Loss 引擎
+                # 🟢 阶段 3: 纯粹靶区 Loss 引擎 (暴力聚焦版)
                 # ==========================================
                 pred_val, delta_coords = model(item)
 
                 # 1. 计算基础 L1 误差
-                loss_pixel = F.l1_loss(pred_val, gt, reduction='none')
+                # 此时所有的 10 万个采样点，已经在 dataset 层面被物理锁死在了膨胀靶区内
+                # 直接求均值，不需要任何空间权重，保证肝脏与缓冲带梯度的平滑过渡
+                loss_recon = F.l1_loss(pred_val, gt, reduction='mean')
 
-                # 2. 🟢 施加空间特权权重 (ROI 惩罚 x5)
-                weight_map = torch.ones_like(loss_pixel)
-                # gt_mask_sampled > 0.5 即代表落在肝脏内部或边缘的点
-                weight_map[gt_mask_sampled > 0.5] = 5.0
-
-                # 加权误差
-                weighted_loss = loss_pixel * weight_map
-                loss_flat = weighted_loss.view(-1)
-
-                # 3. 难例挖掘 (OHEM) 保持你原本的 1.0 (全吸收)
-                hard_ratio = 1.0
-                k = int(loss_flat.numel() * hard_ratio)
-                topk_loss, _ = torch.topk(loss_flat, k)
-                loss_recon = topk_loss.mean()
-
+                # 2. 轻微的位移正则 (防止边缘缓冲带的形变场发散)
                 loss_reg = torch.mean(delta_coords ** 2)
 
-                # 总 Loss
+                # 3. 总 Loss
                 w_reg = 0.02
                 loss = loss_recon + w_reg * loss_reg
+
                 loss_list.append(loss.item())
                 loss.backward()
+                # ==========================================
 
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
@@ -271,27 +264,37 @@ if __name__ == '__main__':
                     t_end = time.time()
                     inference_times.append(t_end - t_start)
 
-                    # 数据解构
+                    # ==========================================
+                    # 🟢 数据解构与终极测谎
+                    # ==========================================
                     pred_np = pred[0, 0].cpu().numpy().reshape(v_item['image'].shape[2:])
                     gt_img_np = target_vol.cpu().numpy()[0, 0]
-                    gt_mask_np = (v_item['mask'].cpu().numpy()[0, 0] == 6).astype(np.float32)
 
-                    # 🟢 终极测谎：提取肝脏的 3D 物理边界框 (BBox)
+                    # 🔴 修复 Bug 1：必须使用形变后的 target_mask 来定位！
+                    gt_mask_np = (target_mask.cpu().numpy()[0, 0] > 0.5).astype(np.float32)
+
+                    # 提取肝脏的 3D 物理边界框 (BBox)
                     coords = np.argwhere(gt_mask_np > 0.5)
                     if len(coords) > 0:
                         x_min, y_min, z_min = coords.min(axis=0)
                         x_max, y_max, z_max = coords.max(axis=0)
 
-                        # 强行裁切出仅包含器官的长方体！抛弃全图 95% 的空间！
+                        # 为了给 SSIM 滑动窗口留下一点计算空间，并检验网络对边界脂肪的拟合
+                        # 我们加上 10 个体素的评估 Margin（不超过训练时的 15）
+                        margin = 10
+                        x_min = max(0, x_min - margin)
+                        y_min = max(0, y_min - margin)
+                        z_min = max(0, z_min - margin)
+                        x_max = min(gt_img_np.shape[0]-1, x_max + margin)
+                        y_max = min(gt_img_np.shape[1]-1, y_max + margin)
+                        z_max = min(gt_img_np.shape[2]-1, z_max + margin)
+
+                        # 强行裁切出包含器官和极其微小缓冲带的干净长方体！
                         gt_roi = gt_img_np[x_min:x_max+1, y_min:y_max+1, z_min:z_max+1]
                         pred_roi = pred_np[x_min:x_max+1, y_min:y_max+1, z_min:z_max+1]
-                        mask_roi = gt_mask_np[x_min:x_max+1, y_min:y_max+1, z_min:z_max+1]
 
-                        # 在这个极小的空间内，依然把剩余的边角料背景涂黑
-                        gt_roi_clean = gt_roi * mask_roi
-                        pred_roi_clean = pred_roi * mask_roi
-
-                        p, s = simple_eval_metric(gt_roi_clean, pred_roi_clean)
+                        # 🔴 避开陷阱 2：绝对不乘 mask_roi！直接评估这个“带肉”的长方体！
+                        p, s = simple_eval_metric(gt_roi, pred_roi)
                         psnrs.append(p)
                         ssims.append(s)
                     else:
