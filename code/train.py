@@ -16,7 +16,7 @@ import logging
 
 from dataset import AMOS_Dataset
 from models.model import DIF_Net
-from utils import convert_cuda, save_visualization_3view, simple_eval, gpu_slice_volume, GPUDailyScanSimulator, ElasticDeformation, simple_eval_metric, compute_gradient
+from utils import convert_cuda, save_visualization_3view, simple_eval, gpu_slice_volume, GPUDailyScanSimulator, PCARespiratoryDeformation, simple_eval_metric, compute_gradient, strict_masked_eval
 
 
 
@@ -35,11 +35,11 @@ class Config:
     preload = False # 如果内存不够（系统盘爆过），建议设为 False
     batch_size = 1
     epoch = 400
-    lr = 5e-4
+    lr = 3e-4
     num_views = 3
     out_res = (256, 256, 128)
-    num_points = 100000 # 配合 ROI 采样，10w 点就能达到很好的效果
-    combine = 'attention'
+    num_points = 500000 # 配合 ROI 采样，10w 点就能达到很好的效果
+    combine = 'mlp'
     eval_freq = 10
     save_freq = 50
     gamma = 0.95
@@ -126,13 +126,13 @@ if __name__ == '__main__':
     # 3. 🟢 优雅初始化调度器 (消除 UserWarning)
     # 直接传入 last_epoch=start_epoch-1，让 PyTorch 自己算好当前应该处于什么学习率
     lr_scheduler = torch.optim.lr_scheduler.StepLR(
-        optimizer, step_size=20, gamma=Config.gamma, last_epoch=start_epoch - 1
+        optimizer, step_size=10, gamma=Config.gamma, last_epoch=start_epoch - 1
     )
 
     # 4. 🟢 补回丢失的形变器与模拟器 (消除 NameError)
     train_simulator = GPUDailyScanSimulator(noise_level=0.0, blur_sigma=0.0).cuda()
     eval_simulator = GPUDailyScanSimulator(noise_level=0.0, blur_sigma=0.0).cuda()
-    deformer = ElasticDeformation(grid_size=8, sigma=Config.sigma).cuda()
+    deformer = PCARespiratoryDeformation(grid_size=4, amp_xyz=(0.01, 0.04, 0.15)).cuda()
 
     logger.info("Start Training Loop...")
     epoch = start_epoch
@@ -148,30 +148,49 @@ if __name__ == '__main__':
 
                 with torch.no_grad():
                     prior_vol = item['image']
-                    prior_mask = (item['mask'] == 6).float() # 🟢 把 Mask 取出来
+                    prior_mask = (item['mask'] == 6).float()
 
                     # 1. 让图像和 Mask 同步发生物理形变
                     combined_vol = torch.cat([prior_vol, prior_mask], dim=1)
                     warped_combined = deformer(combined_vol, mode='bilinear')
 
                     target_vol = warped_combined[:, 0:1]
-                    target_mask = warped_combined[:, 1:2] # 🟢 获取形变后的真实器官位置
+                    target_mask = warped_combined[:, 1:2]
 
                     # 2. 从 Target 中切片并更新输入
                     item['projs'] = gpu_slice_volume(target_vol)
                     item['prior'] = prior_vol
 
-                    # 3. 动态重新采样 GT 和 GT_Mask
+                    # ==========================================================
+                    # 🟢 核心修复：打破离散网格，注入连续随机坐标压制龙格现象
+                    # ==========================================================
+                    B, N, _ = item['points'].shape
+
+                    # 强行生成 [-1.0, 1.0] 之间的纯浮点随机数，摆脱体素中心的束缚
+                    continuous_pts = (torch.rand(B, N, 3, device=target_vol.device) - 0.5) * 2.0
+
+                    # 覆盖原本的离散坐标
+                    item['points'] = continuous_pts
+
+                    # 必须同步更新 2D 投影坐标，保持严丝合缝的物理映射！
+                    item['proj_points'] = torch.stack([
+                        continuous_pts[..., [0, 1]], # Axial (XY)
+                        continuous_pts[..., [0, 2]], # Coronal (XZ)
+                        continuous_pts[..., [1, 2]]  # Sagittal (YZ)
+                    ], dim=1)
+                    # ==========================================================
+
+                    # 3. 动态重新采样 GT 和 GT_Mask (这里的 uv 变成了连续浮点)
                     uv = item['points']
                     uv_sampling = uv[..., [2, 1, 0]].reshape(uv.shape[0], 1, 1, uv.shape[1], 3)
 
-                    # 同时采样像素值和掩码值
+                    # F.grid_sample 强大的插值能力会给出精准的亚像素 GT
                     gt = F.grid_sample(target_vol, uv_sampling, align_corners=True)[:, :, 0, 0, :]
                     gt_mask_sampled = F.grid_sample(target_mask, uv_sampling, align_corners=True)[:, :, 0, 0, :]
                     item['p_gt'] = gt
 
                 # ==========================================
-                # 🟢 阶段 3: 纯粹靶区 Loss 引擎 (暴力聚焦版)
+                # 阶段 3: 纯粹靶区 Loss 引擎
                 # ==========================================
                 pred_val, delta_coords = model(item)
 
@@ -226,26 +245,58 @@ if __name__ == '__main__':
 
                     prior_vol = v_item['image']
 
+                    # # 🟢 1. 记录当前狂野的随机宇宙状态（保护训练的随机性）
+                    # cpu_rng_state = torch.get_rng_state()
+                    # gpu_rng_state = torch.cuda.get_rng_state()
+
+                    # # 🟢 2. 时间静止：为当前样本注入绝对固定的命运 (Seed)
+                    # # 保证 amos_507 每次 eval 遭遇的形变场连小数点后 6 位都一模一样！
+                    # fixed_seed = 2026 + i
+                    # torch.manual_seed(fixed_seed)
+                    # torch.cuda.manual_seed(fixed_seed)
+
+                    # # 🟢 3. 宿命形变：生成永远一致的 Target
+                    # if 'mask' in v_item: # 如果你用了 BBox 评测，把 mask 也带上
+                    #     prior_mask = (v_item['mask'] == 6).float()
+                    #     combined_eval = torch.cat([prior_vol, prior_mask], dim=1)
+                    #     warped_eval = deformer(combined_eval, mode='bilinear')
+                    #     target_vol = warped_eval[:, 0:1]
+                    #     target_mask = warped_eval[:, 1:2]
+                    # else:
+                    #     target_vol = deformer(prior_vol, mode='bilinear')
+                    #     target_mask = None # 视你当前用的哪种 eval 逻辑而定
+
+                    # # 🟢 4. 恢复时间的流动：把随机状态还给系统
+                    # torch.set_rng_state(cpu_rng_state)
+                    # torch.cuda.set_rng_state(gpu_rng_state)
+
                     # 🟢 1. 记录当前狂野的随机宇宙状态（保护训练的随机性）
                     cpu_rng_state = torch.get_rng_state()
                     gpu_rng_state = torch.cuda.get_rng_state()
 
                     # 🟢 2. 时间静止：为当前样本注入绝对固定的命运 (Seed)
-                    # 保证 amos_507 每次 eval 遭遇的形变场连小数点后 6 位都一模一样！
+                    # 保证高频本底弹性噪声微观上 100% 一致！
                     fixed_seed = 2026 + i
                     torch.manual_seed(fixed_seed)
                     torch.cuda.manual_seed(fixed_seed)
 
-                    # 🟢 3. 宿命形变：生成永远一致的 Target
+                    # 🟢 3. 宿命形变：生成永远一致的 Target，且强行锁定呼吸相位！
+                    # 相位 1.5708 (即 π/2) 代表吸气末期，此时 Z 轴下压位移达到理论最大值
+                    # 我们直接用最严苛的物理位移来考验模型的 Eval 指标
+                    test_phase = 1.5708
+
                     if 'mask' in v_item: # 如果你用了 BBox 评测，把 mask 也带上
                         prior_mask = (v_item['mask'] == 6).float()
                         combined_eval = torch.cat([prior_vol, prior_mask], dim=1)
-                        warped_eval = deformer(combined_eval, mode='bilinear')
+
+                        # 🔴 修改 2: 显式传入 fixed_phase
+                        warped_eval = deformer(combined_eval, mode='bilinear', fixed_phase=test_phase)
+
                         target_vol = warped_eval[:, 0:1]
                         target_mask = warped_eval[:, 1:2]
                     else:
-                        target_vol = deformer(prior_vol, mode='bilinear')
-                        target_mask = None # 视你当前用的哪种 eval 逻辑而定
+                        target_vol = deformer(prior_vol, mode='bilinear', fixed_phase=test_phase)
+                        target_mask = None
 
                     # 🟢 4. 恢复时间的流动：把随机状态还给系统
                     torch.set_rng_state(cpu_rng_state)
@@ -265,12 +316,10 @@ if __name__ == '__main__':
                     inference_times.append(t_end - t_start)
 
                     # ==========================================
-                    # 🟢 数据解构与终极测谎
+                    # 🟢 数据解构与终极测谎 (严苛掩码版)
                     # ==========================================
                     pred_np = pred[0, 0].cpu().numpy().reshape(v_item['image'].shape[2:])
                     gt_img_np = target_vol.cpu().numpy()[0, 0]
-
-                    # 🔴 修复 Bug 1：必须使用形变后的 target_mask 来定位！
                     gt_mask_np = (target_mask.cpu().numpy()[0, 0] > 0.5).astype(np.float32)
 
                     # 提取肝脏的 3D 物理边界框 (BBox)
@@ -279,22 +328,32 @@ if __name__ == '__main__':
                         x_min, y_min, z_min = coords.min(axis=0)
                         x_max, y_max, z_max = coords.max(axis=0)
 
-                        # 为了给 SSIM 滑动窗口留下一点计算空间，并检验网络对边界脂肪的拟合
-                        # 我们加上 10 个体素的评估 Margin（不超过训练时的 15）
-                        margin = 10
-                        x_min = max(0, x_min - margin)
-                        y_min = max(0, y_min - margin)
-                        z_min = max(0, z_min - margin)
-                        x_max = min(gt_img_np.shape[0]-1, x_max + margin)
-                        y_max = min(gt_img_np.shape[1]-1, y_max + margin)
-                        z_max = min(gt_img_np.shape[2]-1, z_max + margin)
+                        # Eval 时的 margin 可以极其保守 (仅保留 5 个体素，给 SSIM 窗口提供上下文)
+                        eval_margin = 5
+                        x_min = max(0, x_min - eval_margin)
+                        y_min = max(0, y_min - eval_margin)
+                        z_min = max(0, z_min - eval_margin)
+                        x_max = min(gt_img_np.shape[0]-1, x_max + eval_margin)
+                        y_max = min(gt_img_np.shape[1]-1, y_max + eval_margin)
+                        z_max = min(gt_img_np.shape[2]-1, z_max + eval_margin)
 
-                        # 强行裁切出包含器官和极其微小缓冲带的干净长方体！
+                        # 同时裁出预测值、真实值、真实掩码的 ROI
                         gt_roi = gt_img_np[x_min:x_max+1, y_min:y_max+1, z_min:z_max+1]
                         pred_roi = pred_np[x_min:x_max+1, y_min:y_max+1, z_min:z_max+1]
+                        mask_roi = gt_mask_np[x_min:x_max+1, y_min:y_max+1, z_min:z_max+1]
 
-                        # 🔴 避开陷阱 2：绝对不乘 mask_roi！直接评估这个“带肉”的长方体！
-                        p, s = simple_eval_metric(gt_roi, pred_roi)
+                        # 🔴 调用严苛的 Masked 评价指标！
+                        # 从 utils.py 导入 strict_masked_eval
+                        p, s = strict_masked_eval(gt_roi, pred_roi, mask_roi)
+                        # 将 prior_vol 抠出相同的 ROI
+                        prior_np = prior_vol.cpu().numpy()[0, 0]
+                        prior_roi = prior_np[x_min:x_max+1, y_min:y_max+1, z_min:z_max+1]
+
+                        p_init, s_init = strict_masked_eval(gt_roi, prior_roi, mask_roi)
+
+                        # 找个地方把 p_init, s_init 打印出来或者存到列表里
+                        print(f"  [Metric] Initial SSIM: {s_init:.4f} -> Recon SSIM: {s:.4f}")
+
                         psnrs.append(p)
                         ssims.append(s)
                     else:
@@ -303,9 +362,9 @@ if __name__ == '__main__':
 
             avg_psnr = np.mean(psnrs)
             avg_ssim = np.mean(ssims)
-            avg_time = np.mean(inference_times)
+            # avg_time = np.mean(inference_times)
             eval_msg = f"     [Eval Result] Epoch {epoch}: PSNR = {avg_psnr:.4f} | SSIM = {avg_ssim:.4f}"
-            print(f"Inference Time = {avg_time:.4f}s")
+            # print(f"Inference Time = {avg_time:.4f}s")
             logger.info(eval_msg)
 
         lr_scheduler.step()

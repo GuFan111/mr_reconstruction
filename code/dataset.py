@@ -81,7 +81,7 @@ class AMOS_Dataset(Dataset):
                 mins = nz.min(axis=0)
                 maxs = nz.max(axis=0)
 
-                margin = 15 # 脂肪缓冲带
+                margin = 35 # 脂肪缓冲带
 
                 min_0 = max(0, mins[0] - margin)
                 max_0 = min(vol_clean.shape[0], maxs[0] + margin)
@@ -96,7 +96,7 @@ class AMOS_Dataset(Dataset):
                     np.random.randint(min_1, max_1, self.npoint),
                     np.random.randint(min_2, max_2, self.npoint)
                 ], axis=1)
-            else:
+                # else:
                 coords = np.stack([
                     np.random.randint(0, res_x, self.npoint),
                     np.random.randint(0, res_y, self.npoint),

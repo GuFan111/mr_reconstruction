@@ -239,7 +239,7 @@ class DIF_Net(nn.Module):
         prior_ch = mid_ch // 2
         self.prior_encoder = PriorEncoder(out_ch=prior_ch)
 
-        self.pe_L = 10
+        self.pe_L = 4
         pe_dim = 3 + 3 * 2 * self.pe_L
 
         if self.combine == 'attention':
@@ -259,10 +259,26 @@ class DIF_Net(nn.Module):
 
         print(f'DIF_Net Optimized, mid: {mid_ch}, prior: {prior_ch}')
 
-    def forward(self, data, is_eval=False, eval_npoint=100000):
-        # 1. 提取3D先验特征
-        prior_vol = data['prior']
-        prior_feats_vol = self.prior_encoder(prior_vol)
+        # 🟢 新增：用于存储 3D 先验特征的缓存变量
+        self.cached_prior_feats = None
+        print(f'DIF_Net Optimized with Feature Caching, mid: {mid_ch}')
+
+    # 🟢 新增：清除缓存的方法（换病人时调用）
+    def clear_cache(self):
+        self.cached_prior_feats = None
+
+    def forward(self, data, is_eval=False, eval_npoint=100000, use_cache=False):
+        # 1. 获取 3D 先验特征
+        # 🟢 修改：增加缓存逻辑
+        if is_eval and use_cache and self.cached_prior_feats is not None:
+            # 直接使用缓存，跳过最沉重的 3D Prior Encoder
+            prior_feats_vol = self.cached_prior_feats
+        else:
+            prior_vol = data['prior']
+            prior_feats_vol = self.prior_encoder(prior_vol)
+            # 如果开启了缓存模式，则存入缓存
+            if is_eval and use_cache:
+                self.cached_prior_feats = prior_feats_vol
 
         # 2. 提取2D投影特征
         projs = data['projs']
@@ -320,26 +336,63 @@ class DIF_Net(nn.Module):
         feat_map = proj_feats[0]
         n_view = feat_map.shape[1]
 
+        # ==========================================================
+        # 🟢 核心改造：坐标微扰 (Coordinate Jittering) - 仅在训练阶段生效
+        # ==========================================================
+        pts_3d = data['points']
+        proj_pts = data['proj_points']
+
+        if self.training:
+            # 引入 0.002 (约半个体素) 的随机高斯噪声，打磨鱼鳞伪影
+            noise = torch.randn_like(pts_3d) * 0.002
+            pts_3d = torch.clamp(pts_3d + noise, -1.0, 1.0)
+
+            # 同步更新 2D 投影坐标，确保 3D 和 2D 提取的特征在物理上严格对齐
+            proj_pts = torch.stack([
+                pts_3d[..., [0, 1]], # view 0: Axial (XY)
+                pts_3d[..., [0, 2]], # view 1: Coronal (XZ)
+                pts_3d[..., [1, 2]]  # view 2: Sagittal (YZ)
+            ], dim=1) # 维度变为 [B, 3, N, 2]
+        # ==========================================================
+
         # A. 多源特征聚合
-        # 1. 2D 投影特征采样
         p_list = []
+
+        # 🔴 修改：使用微扰后的 pts_3d 计算距离
+        dist_to_planes = [
+            torch.abs(pts_3d[..., 2]),
+            torch.abs(pts_3d[..., 1]),
+            torch.abs(pts_3d[..., 0])
+        ]
+
+        decay_sigma = 0.05
+
         for i in range(n_view):
             feat = feat_map[:, i, ...]
-            p = data['proj_points'][:, i, ...]
+            # 🔴 修改：使用微扰后同步更新的 proj_pts
+            p = proj_pts[:, i, ...]
+
             p_feats = index_2d(feat, p)
-            p_list.append(p_feats)
+
+            dist = dist_to_planes[i]
+            weight = torch.exp(-(dist ** 2) / (2 * decay_sigma ** 2))
+            weight = weight.unsqueeze(1)
+
+            p_feats_gated = p_feats * weight
+            p_list.append(p_feats_gated)
+
         p_stack = torch.stack(p_list, dim=-1)
 
-        # 2. 先验特征采样
-        p_prior = index_3d(prior_feats_vol, data['points'])
+        # 2. 先验特征采样 (🔴 修改：使用微扰后的 pts_3d)
+        p_prior = index_3d(prior_feats_vol, pts_3d)
 
         if self.combine == 'attention':
             x_slices = p_stack.permute(0, 3, 2, 1)
 
             if ms3dv_volumes is not None:
-                ms3dv_feat = self.ms3dv.sample_features(ms3dv_volumes, data['points'])
+                ms3dv_feat = self.ms3dv.sample_features(ms3dv_volumes, pts_3d) # 🔴 修改
             else:
-                ms3dv_feat = self.ms3dv(feat_map, data['points'])
+                ms3dv_feat = self.ms3dv(feat_map, pts_3d) # 🔴 修改
 
             svc_out = self.fusion_block(x_query=ms3dv_feat, x_slices=x_slices)
 
@@ -356,22 +409,21 @@ class DIF_Net(nn.Module):
         else:
             raise NotImplementedError
 
-        # 位置编码
-        pos_enc = positional_encoding(data['points'], L=self.pe_L)
+        # 位置编码 (🔴 修改：使用微扰后的 pts_3d)
+        pos_enc = positional_encoding(pts_3d, L=self.pe_L)
         p_in = torch.cat([p_fused, pos_enc], dim=-1)
 
         # 3. 坐标变形预测
-        p_in = p_in.transpose(1, 2) # [B, TotalDim, N]
-        out = self.point_classifier(p_in) # [B, 3, N] (注意：不要在这里 transpose)
+        p_in = p_in.transpose(1, 2)
+        out = self.point_classifier(p_in)
 
-        delta_coords = torch.tanh(out) * 0.2 # [B, 3, N]
+        amp = torch.tensor([0.02, 0.06, 0.20], device=out.device).view(1, 3, 1)
+        delta_coords = torch.tanh(out) * amp
 
-        # 为了与坐标 [B, N, 3] 相加，在这里临时转置
-        # data['points'] 形状通常是 [B, N, 3]
-        corrected_coords = data['points'] + delta_coords.transpose(1, 2)
+        # 🔴 修改：预测的形变叠加在微扰后的坐标上
+        corrected_coords = pts_3d + delta_coords.transpose(1, 2)
 
         # 采样
-        sampled_val = index_3d_deform_local(data['prior'], corrected_coords) # [B, 1, N]
+        sampled_val = index_3d_deform_local(data['prior'], corrected_coords)
 
-        # 返回形状统一为 [B, C, N]
         return sampled_val, delta_coords

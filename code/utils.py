@@ -98,7 +98,7 @@ def save_visualization_3view(model, dataset, epoch, device='cuda', save_dir='vis
             torch.cuda.manual_seed(fixed_seed)
 
             # 宿命形变
-            target_vol = prior_deformer(prior_vol, mode='bilinear')
+            target_vol = prior_deformer(prior_vol, mode='bilinear', fixed_phase=1.5708)
 
             # 恢复时间的流动
             torch.set_rng_state(cpu_rng_state)
@@ -341,6 +341,82 @@ class ElasticDeformation(nn.Module):
         deformed_x = F.grid_sample(x, final_grid, mode=mode, padding_mode='reflection', align_corners=True)
 
         return deformed_x
+
+
+class PCARespiratoryDeformation(nn.Module):
+    def __init__(self, grid_size=4, amp_xyz=(0.01, 0.04, 0.15)):
+        super().__init__()
+        self.grid_size = grid_size
+        self.amp_x, self.amp_y, self.amp_z = amp_xyz
+
+    def forward(self, x, mode='bilinear', fixed_phase=None):
+        B, C, D, H, W = x.shape
+        device = x.device
+
+        # 1. 呼吸相位控制
+        if fixed_phase is not None:
+            # Eval 阶段：强制指定处于呼吸的哪个阶段 (例如: 0, pi/2, pi 等)
+            phase = torch.full((B, 1, 1, 1, 1), fixed_phase, device=device, dtype=torch.float32)
+        else:
+            # Train 阶段：随机相位，覆盖整个呼吸周期
+            phase = torch.rand(B, 1, 1, 1, 1, device=device) * 2 * 3.1415926
+
+        # 2. 极低频本底噪声 (继续受 RNG 种子控制，保证微观可重复性)
+        noise_z = torch.randn(B, 1, self.grid_size, self.grid_size, self.grid_size, device=device) * 0.2
+        noise_y = torch.randn(B, 1, self.grid_size, self.grid_size, self.grid_size, device=device) * 0.2
+        noise_x = torch.randn(B, 1, self.grid_size, self.grid_size, self.grid_size, device=device) * 0.3
+
+        # 3. 构造伪 PCA 运动学方程
+        flow_z = (torch.sin(phase) + noise_z) * self.amp_z
+        flow_y = (torch.sin(phase + 3.1415926/4) + noise_y) * self.amp_y
+        flow_x = noise_x * self.amp_x
+
+        flow_coarse = torch.cat([flow_z, flow_y, flow_x], dim=1)
+
+        # 4. 上采样与网格生成保持不变
+        flow = F.interpolate(flow_coarse, size=(D, H, W), mode='trilinear', align_corners=True)
+        flow = flow.permute(0, 2, 3, 4, 1)
+
+        d = torch.linspace(-1, 1, D, device=device)
+        h = torch.linspace(-1, 1, H, device=device)
+        w = torch.linspace(-1, 1, W, device=device)
+        grid_d, grid_h, grid_w = torch.meshgrid(d, h, w, indexing='ij')
+
+        base_grid = torch.stack([grid_w, grid_h, grid_d], dim=-1).unsqueeze(0)
+        final_grid = base_grid + flow
+
+        deformed_x = F.grid_sample(x, final_grid, mode=mode, padding_mode='reflection', align_corners=True)
+
+        return deformed_x
+
+def strict_masked_eval(gt_roi, pred_roi, mask_roi):
+    """
+    最保守的掩码级指标计算
+    gt_roi, pred_roi, mask_roi 尺寸必须完全一致
+    """
+    # 1. 确保 mask 是 0/1 的二值矩阵
+    mask_bin = (mask_roi > 0.5).astype(np.float32)
+    valid_pixels = np.sum(mask_bin)
+
+    if valid_pixels == 0:
+        return 0.0, 0.0
+
+    # 2. Masked MSE & PSNR
+    # 只计算 mask 内部像素的均方误差
+    mse = np.sum(((gt_roi - pred_roi) * mask_bin) ** 2) / valid_pixels
+    if mse == 0:
+        p = 100.0 # 完美对齐
+    else:
+        p = 10 * np.log10(1.0 / mse) # 假设 data_range 为 1.0
+
+    # 3. Masked SSIM
+    # 设置 full=True，返回一张与图像等大的 SSIM 逐像素得分图
+    _, ssim_map = structural_similarity(gt_roi, pred_roi, data_range=1.0, full=True)
+
+    # 仅对 mask 内部的 SSIM 得分进行平均
+    s = np.sum(ssim_map * mask_bin) / valid_pixels
+
+    return p, s
 
 
 def simple_eval_metric(gt, pred):
