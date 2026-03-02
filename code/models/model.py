@@ -10,7 +10,6 @@ from models.point_classifier import SurfaceClassifier
 from models.attention import SVC_Block
 
 
-
 def positional_encoding(p, L=10):
     pi = 3.1415926
     out = [p]
@@ -166,21 +165,16 @@ class MS3DV(nn.Module):
         return vol_agg
 
     def build_volumes(self, proj_feats):
-        """
-        [新函数] 只构建特征体，不采样
-        """
         B, V, C, H, W = proj_feats.shape
         device = proj_feats.device
         volumes = []
 
         for i, s in enumerate(self.scales):
-            # 2D 下采样
             pf_s = proj_feats.view(B*V, C, H, W)
             pf_s = self.downsamplers[i](pf_s)
             _, _, H_s, W_s = pf_s.shape
             pf_s = pf_s.view(B, V, C, H_s, W_s)
 
-            # 3D 反投影与卷积
             res = max(self.grid_res_base // s, 4)
             grid_3d = self.make_grid(B, res, device)
             vol_feat = self.back_project(pf_s, grid_3d)
@@ -190,9 +184,6 @@ class MS3DV(nn.Module):
         return volumes
 
     def sample_features(self, volumes, query_points):
-        """
-        [新函数] 只在已有的特征体上采样
-        """
         B, N, _ = query_points.shape
         C = volumes[0].shape[1]
         feat_samples = []
@@ -200,7 +191,6 @@ class MS3DV(nn.Module):
         q_grid = query_points.view(B, 1, 1, -1, 3)
 
         for vol in volumes:
-            # 采样: [B, C, 1, 1, N]
             sampled = F.grid_sample(vol, q_grid, align_corners=True)
             sampled = sampled.view(B, C, -1).transpose(1, 2)
             feat_samples.append(sampled)
@@ -210,9 +200,52 @@ class MS3DV(nn.Module):
         return out_feat
 
     def forward(self, proj_feats, query_points):
-        # 兼容旧接口 (Training时直接调用)
         volumes = self.build_volumes(proj_feats)
         return self.sample_features(volumes, query_points)
+
+class TriPlaneViewAttention(nn.Module):
+    def __init__(self, view_ch, prior_ch, hidden_ch=64):
+        """
+        view_ch: 2D 投影特征的通道数 (mid_ch=128)
+        prior_ch: 3D 先验特征的通道数 (prior_ch=64)
+        """
+        super().__init__()
+        # 修复：打分器的输入是 3D 坐标 + 先验特征 (3 + prior_ch = 67)
+        self.view_scorer = nn.Sequential(
+            nn.Linear(3 + prior_ch, hidden_ch),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(hidden_ch, hidden_ch // 2),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(hidden_ch // 2, 3),
+            nn.Softmax(dim=-1)
+        )
+
+        # 修复：融合映射是对 2D 视角特征进行的 (view_ch = 128)
+        self.out_proj = nn.Sequential(
+            nn.Linear(view_ch, view_ch),
+            nn.LayerNorm(view_ch),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+
+    def forward(self, pts_3d, prior_feats, view_feats_stack):
+        B, C, N, V = view_feats_stack.shape
+
+        # 1. 准备 Query: 拼接坐标与先验特征 [B, N, 3 + prior_ch]
+        prior_feats_t = prior_feats.transpose(1, 2)
+        attn_query = torch.cat([pts_3d, prior_feats_t], dim=-1)
+
+        # 2. 计算视角注意力权重
+        view_weights = self.view_scorer(attn_query)
+
+        # 3. 动态加权融合
+        view_weights_exp = view_weights.unsqueeze(1)
+        fused_view_feats = (view_feats_stack * view_weights_exp).sum(dim=-1)
+
+        # 4. 最终映射
+        fused_view_feats = fused_view_feats.transpose(1, 2)
+        out_feats = self.out_proj(fused_view_feats)
+
+        return out_feats.transpose(1, 2), view_weights
 
 
 class MLP(nn.Module):
@@ -234,18 +267,18 @@ class DIF_Net(nn.Module):
     def __init__(self, num_views, combine, mid_ch=128):
         super().__init__()
         self.combine = combine
-        self.image_encoder = UNet(1, mid_ch)
+        self.image_encoder = UNet(2, mid_ch)
 
         prior_ch = mid_ch // 2
         self.prior_encoder = PriorEncoder(out_ch=prior_ch)
 
-        self.pe_L = 4
+        self.pe_L = 6
         pe_dim = 3 + 3 * 2 * self.pe_L
 
         if self.combine == 'attention':
-            self.ms3dv = MS3DV(in_ch=mid_ch, out_ch=mid_ch, grid_res_base=32, scales=[1, 2, 4])
-            self.fusion_block = SVC_Block(dim=mid_ch, num_heads=4, mlp_ratio=2.)
-            in_dim = mid_ch + mid_ch + prior_ch + pe_dim
+            self.triplane_attn = TriPlaneViewAttention(view_ch=mid_ch, prior_ch=prior_ch)
+
+            in_dim = mid_ch + prior_ch + pe_dim
             self.point_classifier = SurfaceClassifier(
                 [in_dim, 256, 256, 256, 256, 256, 256, 256, 3], no_residual=True)
 
@@ -259,49 +292,50 @@ class DIF_Net(nn.Module):
 
         print(f'DIF_Net Optimized, mid: {mid_ch}, prior: {prior_ch}')
 
-        # 🟢 新增：用于存储 3D 先验特征的缓存变量
+        # 用于存储 3D 先验特征的缓存变量
         self.cached_prior_feats = None
         print(f'DIF_Net Optimized with Feature Caching, mid: {mid_ch}')
 
-    # 🟢 新增：清除缓存的方法（换病人时调用）
     def clear_cache(self):
         self.cached_prior_feats = None
 
     def forward(self, data, is_eval=False, eval_npoint=100000, use_cache=False):
-        # 1. 获取 3D 先验特征
-        # 🟢 修改：增加缓存逻辑
+        # 1. 获取 3D 先验特征 (保持不变)
         if is_eval and use_cache and self.cached_prior_feats is not None:
-            # 直接使用缓存，跳过最沉重的 3D Prior Encoder
             prior_feats_vol = self.cached_prior_feats
         else:
             prior_vol = data['prior']
             prior_feats_vol = self.prior_encoder(prior_vol)
-            # 如果开启了缓存模式，则存入缓存
             if is_eval and use_cache:
                 self.cached_prior_feats = prior_feats_vol
 
-        # 2. 提取2D投影特征
-        projs = data['projs']
-        b, m, c, w, h = projs.shape
-        projs = projs.reshape(b * m, c, w, h)
-        proj_feats = self.image_encoder(projs)
+        # ==========================================================
+        # 架构升级 2：截取并拼接 2D 切片
+        # ==========================================================
+        # 获取形变后的 Target 切片和原始的 Prior 切片
+        target_projs = data['projs']             # [B, M, 1, W, H]
+        prior_projs = data['prior_projs']        # [B, M, 1, W, H]
 
-        # 恢复维度
+        # 在通道维度 (dim=2) 拼接，生成 2 通道的输入张量
+        combined_projs = torch.cat([target_projs, prior_projs], dim=2) # [B, M, 2, W, H]
+
+        b, m, c, w, h = combined_projs.shape     # 此时的 c 变成了 2
+
+        # 折叠 Batch 和 View 维度，送入 UNet
+        combined_projs = combined_projs.reshape(b * m, c, w, h)
+
+        # 此时 UNet 直接“看”到了两张图的差异，输出的特征将携带极其强烈的位移梯度
+        proj_feats = self.image_encoder(combined_projs)
+
         proj_feats = list(proj_feats) if type(proj_feats) is tuple else [proj_feats]
         for i in range(len(proj_feats)):
             _, c_, w_, h_ = proj_feats[i].shape
             proj_feats[i] = proj_feats[i].reshape(b, m, c_, w_, h_)
 
-        # 预计算 MS3DV 体积
-        ms3dv_volumes = None
-        if self.combine == 'attention':
-            # 取主尺度特征进行 3D 构建
-            ms3dv_volumes = self.ms3dv.build_volumes(proj_feats[0])
-
         if not is_eval:
-            # 训练模式：直接调用
+            # 训练模式：直接调用，移除 ms3dv_volumes 参数
             p_pred, delta_coords = self.forward_points(
-                proj_feats, prior_feats_vol, data, ms3dv_volumes)
+                proj_feats, prior_feats_vol, data)
             return p_pred, delta_coords
         else:
             # 推理模式：分块处理
@@ -320,86 +354,44 @@ class DIF_Net(nn.Module):
                     'prior': data['prior']
                 }
 
-                # 接收预测值和位移场
+                # 同理，在推理循环中移除 ms3dv_volumes 参数
                 p_pred_batch, delta_batch = self.forward_points(
-                    proj_feats, prior_feats_vol, batch_data, ms3dv_volumes)
+                    proj_feats, prior_feats_vol, batch_data)
 
                 pred_list.append(p_pred_batch)
                 delta_list.append(delta_batch)
 
-            # 统一在 dim=2 (N维) 进行拼接
+            # 统一在 dim=2 拼接
             pred = torch.cat(pred_list, dim=2)  # [B, 1, total_N]
             delta = torch.cat(delta_list, dim=2) # [B, 3, total_N]
             return pred, delta
 
-    def forward_points(self, proj_feats, prior_feats_vol, data, ms3dv_volumes=None):
+    def forward_points(self, proj_feats, prior_feats_vol, data, return_delta_only=False):
         feat_map = proj_feats[0]
         n_view = feat_map.shape[1]
 
         # ==========================================================
-        # 🟢 核心改造：坐标微扰 (Coordinate Jittering) - 仅在训练阶段生效
+        # 回滚 1：恢复平滑的 2D 特征投影 (移除距离门控 cutoff)
         # ==========================================================
-        pts_3d = data['points']
-        proj_pts = data['proj_points']
-
-        if self.training:
-            # 引入 0.002 (约半个体素) 的随机高斯噪声，打磨鱼鳞伪影
-            noise = torch.randn_like(pts_3d) * 0.002
-            pts_3d = torch.clamp(pts_3d + noise, -1.0, 1.0)
-
-            # 同步更新 2D 投影坐标，确保 3D 和 2D 提取的特征在物理上严格对齐
-            proj_pts = torch.stack([
-                pts_3d[..., [0, 1]], # view 0: Axial (XY)
-                pts_3d[..., [0, 2]], # view 1: Coronal (XZ)
-                pts_3d[..., [1, 2]]  # view 2: Sagittal (YZ)
-            ], dim=1) # 维度变为 [B, 3, N, 2]
-        # ==========================================================
-
-        # A. 多源特征聚合
         p_list = []
-
-        # 🔴 修改：使用微扰后的 pts_3d 计算距离
-        dist_to_planes = [
-            torch.abs(pts_3d[..., 2]),
-            torch.abs(pts_3d[..., 1]),
-            torch.abs(pts_3d[..., 0])
-        ]
-
-        decay_sigma = 0.05
-
         for i in range(n_view):
             feat = feat_map[:, i, ...]
-            # 🔴 修改：使用微扰后同步更新的 proj_pts
-            p = proj_pts[:, i, ...]
-
+            p = data['proj_points'][:, i, ...]
             p_feats = index_2d(feat, p)
-
-            dist = dist_to_planes[i]
-            weight = torch.exp(-(dist ** 2) / (2 * decay_sigma ** 2))
-            weight = weight.unsqueeze(1)
-
-            p_feats_gated = p_feats * weight
-            p_list.append(p_feats_gated)
-
+            p_list.append(p_feats)
         p_stack = torch.stack(p_list, dim=-1)
 
-        # 2. 先验特征采样 (🔴 修改：使用微扰后的 pts_3d)
-        p_prior = index_3d(prior_feats_vol, pts_3d)
+        # 2. 先验特征采样
+        p_prior = index_3d(prior_feats_vol, data['points'])
 
         if self.combine == 'attention':
-            x_slices = p_stack.permute(0, 3, 2, 1)
-
-            if ms3dv_volumes is not None:
-                ms3dv_feat = self.ms3dv.sample_features(ms3dv_volumes, pts_3d) # 🔴 修改
-            else:
-                ms3dv_feat = self.ms3dv(feat_map, pts_3d) # 🔴 修改
-
-            svc_out = self.fusion_block(x_query=ms3dv_feat, x_slices=x_slices)
-
-            pixel_max, _ = torch.max(p_stack, dim=-1)
-            pixel_max = pixel_max.permute(0, 2, 1)
-
-            p_fused = torch.cat([svc_out, pixel_max, p_prior.transpose(1, 2)], dim=-1)
+            fused_view_feats, view_weights = self.triplane_attn(
+                pts_3d=data['points'],
+                prior_feats=p_prior,
+                view_feats_stack=p_stack
+            )
+            # 拼接: 融合后的2D视角特征 + 3D先验特征
+            p_fused = torch.cat([fused_view_feats.transpose(1, 2), p_prior.transpose(1, 2)], dim=-1)
 
         elif self.combine == 'mlp':
             p_feats = p_stack.permute(0, 3, 1, 2)
@@ -409,21 +401,22 @@ class DIF_Net(nn.Module):
         else:
             raise NotImplementedError
 
-        # 位置编码 (🔴 修改：使用微扰后的 pts_3d)
-        pos_enc = positional_encoding(pts_3d, L=self.pe_L)
+        # 位置编码
+        pos_enc = positional_encoding(data['points'], L=self.pe_L)
         p_in = torch.cat([p_fused, pos_enc], dim=-1)
 
         # 3. 坐标变形预测
         p_in = p_in.transpose(1, 2)
         out = self.point_classifier(p_in)
 
-        amp = torch.tensor([0.02, 0.06, 0.20], device=out.device).view(1, 3, 1)
+        # ==========================================================
+        # 回滚 2：放宽物理截断边界
+        # 相比于 [0.02, 0.06, 0.20]，给予更宽容的缓冲空间防止撞墙产生色块
+        # ==========================================================
+        amp = torch.tensor([0.05, 0.10, 0.25], device=out.device).view(1, 3, 1)
         delta_coords = torch.tanh(out) * amp
 
-        # 🔴 修改：预测的形变叠加在微扰后的坐标上
-        corrected_coords = pts_3d + delta_coords.transpose(1, 2)
-
-        # 采样
+        corrected_coords = data['points'] + delta_coords.transpose(1, 2)
         sampled_val = index_3d_deform_local(data['prior'], corrected_coords)
 
         return sampled_val, delta_coords

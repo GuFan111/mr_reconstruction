@@ -30,14 +30,35 @@ class AMOS_Dataset(Dataset):
         self.preload = preload
         self.data_cache = []
 
-        # --- 保留你原来的文件划分逻辑 ---
+        # 1. 必须排序，这是保证每次运行切片结果 100% 一致的物理底线 (可复现性)
         all_files = sorted(glob.glob(os.path.join(data_root, '*.npy')))
-        n = len(all_files)
-        # (此处省略你原来的 80/10/10 划分代码，保持不变即可)
-        self.file_list = all_files # 假设已划分
+        n_total = len(all_files)
 
+        # 2. 经典的 80% 训练，20% 验证划分
+        train_ratio = 0.8
+        train_size = int(n_total * train_ratio)
+
+        # 3. 物理切断数据流
+        train_files = all_files[:train_size]
+        val_files = all_files[train_size:]
+
+        # 4. 根据传入的 split 参数分配 file_list
+        if self.split == 'train':
+            self.file_list = train_files
+            print(f"[Dataset] Train Split: {len(self.file_list)} samples")
+        elif self.split == 'eval' or self.split == 'test':
+            self.file_list = val_files
+            print(f"[Dataset] Eval Split: {len(self.file_list)} samples")
+        elif self.split == 'all':
+            # 预留给寻找 Sigma 甜点区的全量扫描模式
+            self.file_list = all_files
+            print(f"[Dataset] All Split (Sweep Mode): {len(self.file_list)} samples")
+        else:
+            raise ValueError(f"Unknown split mode: {self.split}")
+
+        # --- 后续的 preload 逻辑保持不变 ---
         if self.preload:
-            for path in tqdm(self.file_list, desc=f"[{split}] Pre-loading"):
+            for path in tqdm(self.file_list, desc=f"[{self.split}] Pre-loading"):
                 self.data_cache.append(np.load(path))
 
     def __len__(self):
@@ -74,39 +95,62 @@ class AMOS_Dataset(Dataset):
         res_max = max(res_x, res_y, res_z)
         projs = np.zeros((3, 1, res_max, res_max), dtype=np.float32)
 
-        # 4. 实时动态靶区计算 (ROI 暴力聚焦)
+        # 4. 实时动态靶区计算 (80% ROI + 20% Global)
         if self.split == 'train':
             nz = np.argwhere(mask_np > 0)
             if len(nz) > 0:
                 mins = nz.min(axis=0)
                 maxs = nz.max(axis=0)
 
-                margin = 35 # 脂肪缓冲带
-
+                margin = 35 # 维持你的脂肪缓冲带设计
                 min_0 = max(0, mins[0] - margin)
-                max_0 = min(vol_clean.shape[0], maxs[0] + margin)
+                max_0 = min(res_x, maxs[0] + margin) # 注意这里用 res_x 约束边界
                 min_1 = max(0, mins[1] - margin)
-                max_1 = min(vol_clean.shape[1], maxs[1] + margin)
+                max_1 = min(res_y, maxs[1] + margin)
                 min_2 = max(0, mins[2] - margin)
-                max_2 = min(vol_clean.shape[2], maxs[2] + margin)
+                max_2 = min(res_z, maxs[2] + margin)
 
-                # 100% 算力死死锁在膨胀靶区内
-                coords = np.stack([
-                    np.random.randint(min_0, max_0, self.npoint),
-                    np.random.randint(min_1, max_1, self.npoint),
-                    np.random.randint(min_2, max_2, self.npoint)
+                # 设定采样比例
+                n_fg = int(self.npoint * 0.8)
+                n_bg = self.npoint - n_fg
+
+                # 80% 的点锁在膨胀靶区内
+                coords_fg = np.stack([
+                    np.random.randint(min_0, max_0, n_fg),
+                    np.random.randint(min_1, max_1, n_fg),
+                    np.random.randint(min_2, max_2, n_fg)
                 ], axis=1)
-                # else:
+
+                # 20% 的点在全图中随机撒网 (防止空间崩溃)
+                coords_bg = np.stack([
+                    np.random.randint(0, res_x, n_bg),
+                    np.random.randint(0, res_y, n_bg),
+                    np.random.randint(0, res_z, n_bg)
+                ], axis=1)
+
+                # 拼接坐标并生成标签位
+                coords = np.concatenate([coords_fg, coords_bg], axis=0)
+                is_fg = np.concatenate([np.ones(n_fg), np.zeros(n_bg)]).astype(np.float32)
+
+                # 随机打乱一下顺序 (可选，消除 batch 内部的相关性)
+                shuffle_idx = np.random.permutation(self.npoint)
+                coords = coords[shuffle_idx]
+                is_fg = is_fg[shuffle_idx]
+
+            else:
+                # 兜底：如果完全没有 Mask，则全图采样
                 coords = np.stack([
                     np.random.randint(0, res_x, self.npoint),
                     np.random.randint(0, res_y, self.npoint),
                     np.random.randint(0, res_z, self.npoint)
                 ], axis=1)
+                is_fg = np.zeros(self.npoint, dtype=np.float32)
         else:
-            # 推理模式：全图网格采样
+            # 推理模式：全图网格采样保持不变
             coords = self.eval_points_as_indices()
+            is_fg = np.zeros(coords.shape[0], dtype=np.float32) # 推理时不使用加权
 
-            # 5. 物理空间归一化 [-1, 1]
+        # 5. 物理空间归一化 [-1, 1]
         values = vol_clean[coords[:, 0], coords[:, 1], coords[:, 2]]
         res_array = np.array([res_x, res_y, res_z], dtype=np.float32)
         points_norm = ((coords.astype(np.float32) / (res_array - 1)) - 0.5) * 2
@@ -125,5 +169,6 @@ class AMOS_Dataset(Dataset):
             'proj_points': proj_points.astype(np.float32),
             'p_gt': values[None, :].astype(np.float32),
             'image': vol_clean[None, ...],
-            'mask': mask_np[None, ...]
+            'mask': mask_np[None, ...],
+            'point_is_fg': is_fg
         }
