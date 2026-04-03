@@ -34,7 +34,7 @@ class Config:
     num_workers = 4                   # DataLoader 进程数
     preload = False                   # 是否将所有数据预加载到内存（数据量大时易爆内存）
     batch_size = 4                    # 批大小
-    epoch = 500                       # 总训练轮次
+    epoch = 600                       # 总训练轮次
     lr = 1.4e-4                         # 初始学习率
     num_views = 3                     # 输入的稀疏切片数量 (Axial, Coronal, Sagittal)
     out_res = (128, 128, 128)         # 3D 物理体素重构分辨率

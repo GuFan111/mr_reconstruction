@@ -98,6 +98,82 @@ class ProstateDeformer:
 
         return deformed_img.squeeze().numpy(), deformed_mask.squeeze().numpy()
 
+
+class LocalProstateDeformer:
+    """
+    高度局部化的盆腔生物力学形变引擎 (Local Biomechanical Deformer)
+    学术修正：彻底切断全局背景的协同作弊。形变仅在前列腺 (Mask) 及其紧邻的筋膜区域发生，
+    外围物理空间（骨盆、远端直肠）将被强制冻结。
+    """
+    def __init__(self, max_translation=15.0, max_scale=0.05, grid_size=7, max_displacement=10.0, influence_sigma=12.0):
+        self.max_t = max_translation
+        self.max_s = max_scale
+        self.grid_size = grid_size
+        self.max_d = max_displacement / 64.0
+        # influence_sigma 控制形变力场向前列腺外围辐射的衰减距离 (物理单位：体素)
+        self.influence_sigma = influence_sigma
+
+    def __call__(self, image, mask):
+        img_t = torch.from_numpy(image).unsqueeze(0).unsqueeze(0).float()
+        mask_t = torch.from_numpy(mask).unsqueeze(0).unsqueeze(0).float()
+        D, H, W = image.shape
+
+        # ==========================================
+        # 1. 制造局部的力场衰减权重 (Spatial Influence Weight)
+        # ==========================================
+        # 对 Mask 进行高斯平滑，制造一个从 1 平滑衰减到 0 的光晕
+        influence_np = ndimage.gaussian_filter(mask.astype(np.float32), sigma=self.influence_sigma)
+        # 归一化，确保中心最大力场依然是 100%
+        if influence_np.max() > 0:
+            influence_np = influence_np / influence_np.max()
+
+        # 转换为 Tensor，准备与位移场相乘。Shape: (1, D, H, W, 1)
+        influence_weight = torch.from_numpy(influence_np).view(1, D, H, W, 1).float()
+
+        # ==========================================
+        # 2. 生成弹性形变场并进行物理截断
+        # ==========================================
+        noise_grid = (torch.rand(1, 3, self.grid_size, self.grid_size, self.grid_size) * 2.0 - 1.0) * self.max_d
+
+        biomechanical_weights = torch.tensor([0.3, 1.2, 1.0]).view(1, 3, 1, 1, 1)
+        noise_grid = noise_grid * biomechanical_weights
+
+        disp_field = F.interpolate(noise_grid, size=(D, H, W), mode='trilinear', align_corners=True)
+        disp_field = disp_field.permute(0, 2, 3, 4, 1)
+
+        # 🔴 核心物理修正：将全局位移场与局部衰减权重相乘
+        # 这意味着背景的位移将被强行清零，形变被彻底锁死在靶区周围
+        local_disp_field = disp_field * influence_weight
+
+        # ==========================================
+        # 3. 剥离全局仿射变换 (切断最后一条作弊路径)
+        # ==========================================
+        # 既然是纯粹的靶区局部挤压，我们必须将全局的平移和缩放幅度大幅降低，甚至置 0。
+        # 这里为了对照实验，我们将原本的全局仿射极度削弱。
+        tx = np.random.uniform(-self.max_t, self.max_t) / (D / 2) * 0.1
+        ty = np.random.uniform(-self.max_t, self.max_t) / (H / 2) * 0.1
+        tz = np.random.uniform(-self.max_t, self.max_t) / (W / 2) * 0.1
+
+        sx, sy, sz = 1.0, 1.0, 1.0 # 强制关闭全局缩放
+
+        theta = torch.tensor([[[1.0/sx, 0, 0, tx],
+                               [0, 1.0/sy, 0, ty],
+                               [0, 0, 1.0/sz, tz]]], dtype=torch.float32)
+
+        base_grid = F.affine_grid(theta, img_t.size(), align_corners=True)
+
+        # 将被阉割的全局网格加上只在局部起效的位移场
+        final_grid = base_grid + local_disp_field
+
+        # ==========================================
+        # 4. 执行重采样
+        # ==========================================
+        deformed_img = F.grid_sample(img_t, final_grid, mode='bilinear', padding_mode='zeros', align_corners=True)
+        soft_deformed_mask = F.grid_sample(mask_t, final_grid, mode='bilinear', padding_mode='zeros', align_corners=True)
+        deformed_mask = (soft_deformed_mask > 0.5).float()
+
+        return deformed_img.squeeze().numpy(), deformed_mask.squeeze().numpy()
+
 # ==========================================
 # 🟢 核心数据管线 (Data Pipeline)
 # 承载了粗到细架构 (Coarse-to-fine) 的第一步
@@ -115,7 +191,13 @@ class Prostate_Dataset(Dataset):
         self.preload = preload
         self.data_cache = []
 
-        self.deformer = ProstateDeformer(max_translation=15.0, max_scale=0.05)
+        # self.deformer = ProstateDeformer(max_translation=15.0, max_scale=0.05)
+        self.deformer = LocalProstateDeformer(
+            max_translation=15.0,    # 保留接口，但在底层已被强制削弱至 10% 以防全局漂移
+            max_scale=0.05,          # 保留接口，但在底层已被强制关闭
+            max_displacement=15.0,   # 🟢 核心动能：靶区边缘被挤压的最大绝对物理位移
+            influence_sigma=12.0     # 🔴 生死旋钮：形变力场向外围骨盆辐射的衰减半径（体素）
+        )
 
         self.file_list = sorted(glob.glob(os.path.join(self.data_root, '*.npy')))
 
@@ -290,12 +372,24 @@ class Prostate_Dataset(Dataset):
         # 6. 数据字典封装并出栈
         return {
             'name': name,
+
+            # ==========================================
+            # 🟢 Baseline 3D CNN 特供数据 (密集 3D 张量)
+            # ==========================================
+            'target_image': target_image[None, ...].astype(np.float32),        # [1, D, H, W] 当天形变图
+            'prior_image': aligned_prior_image[None, ...].astype(np.float32),  # [1, D, H, W] 刚性对齐后的昨天图
+            'prior_mask': aligned_prior_mask[None, ...].astype(np.float32),    # [1, D, H, W] 刚性对齐后的昨天标签
+            'target_mask': target_mask[None, ...].astype(np.float32),          # [1, D, H, W] 当天真实标签(算Loss用)
+            'center_coords': np.array([cx, cy, cz], dtype=np.float32),         # [3] 正交切片相交的中心坐标
+
+            # ==========================================
+            # 🟢 DIF-Net 隐式点云网络特供数据
+            # ==========================================
             'projs': projs,
             'prior_projs': prior_projs,
             'points': points_norm.astype(np.float32),
             'proj_points': proj_points.astype(np.float32),
             'p_gt': values[None, :].astype(np.float32),
-            'prior_mask': aligned_prior_mask[None, ...].astype(np.float32), # 网络看到的先验已完全去除了大尺度位移
-            'target_image': target_image[None, ...].astype(np.float32),
-            'is_lock': is_lock[None, :].astype(np.float32) # 输出锁定信标，供 Loss 计算
+            'is_lock': is_lock[None, :].astype(np.float32),
+            'coords': coords # 保留原有的点云系，防止破坏你 DIF-Net 的其他逻辑
         }
