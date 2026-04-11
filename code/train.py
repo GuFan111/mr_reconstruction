@@ -26,20 +26,20 @@ from utils import compute_com_error, save_visualization_3view
 #  核心配置区域 (Hyperparameters & Config)
 # ==========================================
 class Config:
-    name = 'prostate_new_2'           # 实验名称，对应 logs 下的文件夹名
+    name = 'prostate_4_8_mlp'           # 实验名称，对应 logs 下的文件夹名
     data_root = r'/root/autodl-tmp/Proj/data/prostate_158_128' # 数据集根目录
-    # resume_path = None                # 预训练权重路径，设置为 None 表示从零训练
-    resume_path = r'/root/autodl-tmp/Proj/code/logs/prostate_new_2/model_best.pth'
+    resume_path = None                # 预训练权重路径，设置为 None 表示从零训练
+    # resume_path = r'/root/autodl-tmp/Proj/code/logs/prostate_new_2/model_best.pth'
     gpu_id = 0                        # 使用的 GPU 序号
     num_workers = 4                   # DataLoader 进程数
     preload = False                   # 是否将所有数据预加载到内存（数据量大时易爆内存）
     batch_size = 4                    # 批大小
-    epoch = 600                       # 总训练轮次
-    lr = 1.4e-4                         # 初始学习率
+    epoch = 1000                       # 总训练轮次
+    lr = 2e-4                         # 初始学习率
     num_views = 3                     # 输入的稀疏切片数量 (Axial, Coronal, Sagittal)
     out_res = (128, 128, 128)         # 3D 物理体素重构分辨率
     num_points = 80000                # 每次前向传播在 3D 空间中采样的点云数量
-    combine = 'attention'             # 稀疏视图特征融合策略（三平面注意力机制 Tri-Att）
+    combine = 'mlp'             # 稀疏视图特征融合策略（三平面注意力机制 Tri-Att）
     eval_freq = 5                     # 验证集评估频率 (每 N 轮评估一次)
     save_freq = 20                    # 权重常规保存频率 (每 N 轮保存一次)
     gamma = 0.95                      # 学习率衰减率 (StepLR)

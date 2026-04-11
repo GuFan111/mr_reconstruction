@@ -220,21 +220,30 @@ class DIF_Net(nn.Module):
         # 限制高频以避免锯齿伪影
         self.pe_L = 2
         pe_dim = 3 + 3 * 2 * self.pe_L
+        in_dim = mid_ch + prior_ch + pe_dim
 
         # 下游融合与分类引擎
         if self.combine == 'attention':
             self.triplane_attn = TriPlaneViewAttention(view_ch=mid_ch, prior_ch=prior_ch)
-            in_dim = mid_ch + prior_ch + pe_dim
-            # 最终的占据网络 (Occupancy Network)
-            self.point_classifier = SurfaceClassifier(
-                [in_dim, 256, 256, 256, 256, 256, 256, 256, 1], no_residual=True)
         elif self.combine == 'mlp':
-            self.view_mixer = MLP([num_views, num_views // 2, 1])
-            in_dim = mid_ch + prior_ch + pe_dim
-            self.point_classifier = SurfaceClassifier(
-                [in_dim, 256, 64, 16, 1], no_residual=True)
+            # 🔴 修正：标准的点级 MLP 融合器 (Point-wise MLP Mixer)
+            # 输入：把 3 个视图的 128 维特征拼接起来 (3 * 128 = 384)
+            # 输出：融合回一个 128 维的特征向量
+            self.view_mixer = nn.Sequential(
+                nn.Linear(num_views * mid_ch, mid_ch * 2),
+                nn.LayerNorm(mid_ch * 2),
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.Linear(mid_ch * 2, mid_ch),
+                nn.LayerNorm(mid_ch),
+                nn.LeakyReLU(0.2, inplace=True)
+            )
         else:
             raise NotImplementedError
+
+        # 🔴 修正 2：将分类器的初始化统一移到外部。
+        # 无论前面走哪条分支，最终都必须面对这尊 8 层 256 通道的“守护神”。
+        self.point_classifier = SurfaceClassifier(
+            [in_dim, 256, 256, 256, 256, 256, 256, 256, 1], no_residual=True)
 
         self.cached_prior_feats = None
 
@@ -330,10 +339,17 @@ class DIF_Net(nn.Module):
             # 将 2D 截面推演特征与 3D 骨架特征级联
             p_fused = torch.cat([fused_view_feats.transpose(1, 2), p_prior.transpose(1, 2)], dim=-1)
         elif self.combine == 'mlp':
-            p_feats = p_stack.permute(0, 3, 1, 2)
-            p_fused = self.view_mixer(p_feats).squeeze(1)
-            p_fused = p_fused.permute(0, 2, 1)
-            p_fused = torch.cat([p_fused, p_prior.transpose(1, 2)], dim=-1)
+            # 🔴 修正：p_stack shape is [B, C=128, N=50000, 3]
+            # 目标：把视角维度和特征维度拼合，变成 [B, N, 3*128]
+            B, C, N, V = p_stack.shape
+            p_feats = p_stack.permute(0, 2, 3, 1) # 变成 [B, N, 3, 128]
+            p_feats = p_feats.reshape(B, N, V * C) # 变成 [B, N, 384]
+
+            # 通过 MLP 进行点级映射，输出形状为 [B, N, 128]
+            fused_view_feats = self.view_mixer(p_feats)
+
+            # 将 2D 截面推演特征与 3D 骨架特征级联
+            p_fused = torch.cat([fused_view_feats, p_prior.transpose(1, 2)], dim=-1)
 
         # D. 注入高频位置编码并推演占据概率
         pos_enc = positional_encoding(data['points'], L=self.pe_L)

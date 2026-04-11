@@ -174,6 +174,70 @@ class LocalProstateDeformer:
 
         return deformed_img.squeeze().numpy(), deformed_mask.squeeze().numpy()
 
+
+class ExtremeLocalProstateDeformer:
+    """
+    法医级视觉处决引擎 (Forensic Visual Execution Engine)
+    设计目的：产生肉眼可见的、极其暴力的局部不规则扭曲，制造高频的“拓扑断层”。
+    专门用于生成论文 Figure 1 和 Figure 2 的定性对比图。
+    """
+    def __init__(self, max_translation=5.0, grid_size=5, max_displacement=25.0, influence_sigma=6.0):
+        # 关掉全局平移，专注局部撕裂
+        self.max_t = max_translation
+        # 缩小 grid_size，让低频网格在插值后产生巨大的单向局部隆起
+        self.grid_size = grid_size
+        # 极度放大的形变幅度 (肉眼绝对可见)
+        self.max_d = max_displacement / 64.0
+        # 更小的 sigma 制造更陡峭的力场边界
+        self.influence_sigma = influence_sigma
+
+    def __call__(self, image, mask):
+        img_t = torch.from_numpy(image).unsqueeze(0).unsqueeze(0).float()
+        mask_t = torch.from_numpy(mask).unsqueeze(0).unsqueeze(0).float()
+        D, H, W = image.shape
+
+        # 1. 制造局部的力场衰减权重 (陡峭的拓扑悬崖)
+        influence_np = ndimage.gaussian_filter(mask.astype(np.float32), sigma=self.influence_sigma)
+        if influence_np.max() > 0:
+            influence_np = influence_np / influence_np.max()
+
+        # 🔴 杀招：非线性锐化力场边界。使得靠近器官边缘的受力极大，但外部迅速跌落至 0
+        influence_np = np.power(influence_np, 0.3)
+        influence_weight = torch.from_numpy(influence_np).view(1, D, H, W, 1).float()
+
+        # 2. 生成极端的非各向同性弹性形变场
+        # 使用 randn 产生更极端的峰值
+        noise_grid = (torch.randn(1, 3, self.grid_size, self.grid_size, self.grid_size)) * self.max_d
+
+        # 🔴 杀招：极其变态的解剖学权重
+        # 锁死 X 轴(0.1)，将全部的形变动能倾泻在 Y 轴(直肠挤压, 2.0)
+        biomechanical_weights = torch.tensor([0.1, 2.0, 1.5]).view(1, 3, 1, 1, 1)
+        noise_grid = noise_grid * biomechanical_weights
+
+        disp_field = F.interpolate(noise_grid, size=(D, H, W), mode='trilinear', align_corners=True)
+        disp_field = disp_field.permute(0, 2, 3, 4, 1)
+
+        # 将极端撕裂力场锁定在靶区
+        local_disp_field = disp_field * influence_weight
+
+        # 3. 几乎忽略不计的全局仿射 (防作弊)
+        tx = np.random.uniform(-self.max_t, self.max_t) / (D / 2)
+        ty = np.random.uniform(-self.max_t, self.max_t) / (H / 2)
+        tz = np.random.uniform(-self.max_t, self.max_t) / (W / 2)
+
+        theta = torch.tensor([[[1.0, 0, 0, tx],
+                               [0, 1.0, 0, ty],
+                               [0, 0, 1.0, tz]]], dtype=torch.float32)
+        base_grid = F.affine_grid(theta, img_t.size(), align_corners=True)
+        final_grid = base_grid + local_disp_field
+
+        # 4. 执行重采样
+        deformed_img = F.grid_sample(img_t, final_grid, mode='bilinear', padding_mode='zeros', align_corners=True)
+        soft_deformed_mask = F.grid_sample(mask_t, final_grid, mode='bilinear', padding_mode='zeros', align_corners=True)
+        deformed_mask = (soft_deformed_mask > 0.5).float()
+
+        return deformed_img.squeeze().numpy(), deformed_mask.squeeze().numpy()
+
 # ==========================================
 # 🟢 核心数据管线 (Data Pipeline)
 # 承载了粗到细架构 (Coarse-to-fine) 的第一步
@@ -191,13 +255,55 @@ class Prostate_Dataset(Dataset):
         self.preload = preload
         self.data_cache = []
 
-        # self.deformer = ProstateDeformer(max_translation=15.0, max_scale=0.05)
-        self.deformer = LocalProstateDeformer(
-            max_translation=15.0,    # 保留接口，但在底层已被强制削弱至 10% 以防全局漂移
-            max_scale=0.05,          # 保留接口，但在底层已被强制关闭
-            max_displacement=15.0,   # 🟢 核心动能：靶区边缘被挤压的最大绝对物理位移
-            influence_sigma=12.0     # 🔴 生死旋钮：形变力场向外围骨盆辐射的衰减半径（体素）
-        )
+        self.deformer = ProstateDeformer(max_translation=15.0, max_scale=0.05)
+        # self.deformer = LocalProstateDeformer(
+        #     max_translation=15.0,    # 保留接口，但在底层已被强制削弱至 10% 以防全局漂移
+        #     max_scale=0.05,          # 保留接口，但在底层已被强制关闭
+        #     max_displacement=15.0,   # 🟢 核心动能：靶区边缘被挤压的最大绝对物理位移
+        #     influence_sigma=12.0     # 🔴 生死旋钮：形变力场向外围骨盆辐射的衰减半径（体素）
+        # )
+
+        # self.deformer = ExtremeLocalProstateDeformer(
+        #     max_translation=3.0,     # 进一步限制全局平移误差，模拟极其精准的临床摆位（Setup accuracy）
+        #     grid_size=6,
+        #     max_displacement=3.0,    # 🟢 终极降维：将绝对位移压缩至仅仅 2.0 mm。这在临床上甚至低于 MRI 的层厚误差，纯粹的微小生理脉动
+        #     influence_sigma=14.0     # 🔴 彻底抹平拓扑断层：极大的衰减半径，让这区区 2mm 的位移像水波一样极其平滑地散开，没有任何局部应力集中
+        # )
+
+        # self.deformer = ExtremeLocalProstateDeformer(
+        #     max_translation=5.0,
+        #     grid_size=6,             # 🟡 稍微增加一点网格，让形变像真实的组织挤压，而不是一块单一的陨石砸下来
+        #     max_displacement=16.0,   # 🟢 从 25.0 退回 16.0。1.6 厘米的直肠气袋极度挤压在临床上是真实存在的极限
+        #     influence_sigma=8.0      # 🔴 从 6.0 放宽到 8.0。给隐式场一个可以连续推演的物理缓冲坡度，但依然陡峭到足够让 CNN 发生断层
+        # )
+
+        # self.deformer = ExtremeLocalProstateDeformer(
+        #     max_translation=5.0,
+        #     grid_size=6,
+        #     max_displacement=5.0,    # 仅 5mm 的绝对挤压，日常生理变异
+        #     influence_sigma=12.0     # 大范围的弹性缓冲，组织犹如凝胶般平滑过渡
+        # )
+
+        # self.deformer = ExtremeLocalProstateDeformer(
+        #     max_translation=5.0,
+        #     grid_size=6,
+        #     max_displacement=10.0,   # 10mm 的物理推进，临床上需要警惕的位移
+        #     influence_sigma=10.0     # 缓冲半径开始收缩，应力梯度上升
+        # )
+
+        # self.deformer = ExtremeLocalProstateDeformer(
+        #     max_translation=5.0,
+        #     grid_size=6,
+        #     max_displacement=13.0,   # 13mm 的严重挤压
+        #     influence_sigma=9.0      # 拓扑悬崖初步形成
+        # )
+
+        # self.deformer = ExtremeLocalProstateDeformer(
+        #     max_translation=5.0,
+        #     grid_size=6,
+        #     max_displacement=20.0,   # 20mm 的毁灭性局部撕裂
+        #     influence_sigma=6.0      # 彻底失去物理缓冲，前列腺边缘经历断崖式的虚空切割
+        # )
 
         self.file_list = sorted(glob.glob(os.path.join(self.data_root, '*.npy')))
 
