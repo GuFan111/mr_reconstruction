@@ -100,18 +100,18 @@ class QinBlindTestDataset(Dataset):
 # ==========================================
 class QinForensicConfig:
     # 🔴 算法处决开关: 'difnet_tto', 'difnet_no_tto', '3dunet', 'swin_unetr'
-    model_type = 'difnet_no_tto'
-    name = f'qin_4_8_attention_{model_type}'
+    model_type = 'swin_unetr'
+    name = f'qin_4_8_{model_type}'
     gpu_id = 0
     data_root = '/root/autodl-tmp/Proj/data/qin_testset_npy'
 
     model_weights = {
-        'difnet_tto': '/root/autodl-tmp/Proj/code/logs/prostate_4_8_attention/model_best.pth',
-        'difnet_no_tto': '/root/autodl-tmp/Proj/code/logs/prostate_4_8_attention/model_best.pth',
-        # 'difnet_tto': '/root/autodl-tmp/Proj/code/logs/prostate_4_8_mlp/model_best.pth',
-        # 'difnet_no_tto': '/root/autodl-tmp/Proj/code/logs/prostate_4_8_mlp/model_best.pth',
-        '3dunet': '/root/autodl-tmp/Proj/code/logs/baseline_3dunet_sparse_amp/model_best.pth',
-        'swin_unetr': '/root/autodl-tmp/Proj/code/logs/baseline_swin_unetr_sparse_amp/model_best.pth'
+        # 'difnet_tto': '/root/autodl-tmp/Proj/code/logs/prostate_4_8_attention/model_best.pth',
+        # 'difnet_no_tto': '/root/autodl-tmp/Proj/code/logs/prostate_4_8_attention/model_best.pth',
+        'difnet_tto': '/root/autodl-tmp/Proj/code/logs/prostate_4_8_mlp/model_best.pth',
+        'difnet_no_tto': '/root/autodl-tmp/Proj/code/logs/prostate_4_8_mlp/model_best.pth',
+        '3dunet': '/root/autodl-tmp/Proj/code/logs/baseline_3dunet_sparse_amp_4_8/model_best.pth',
+        'swin_unetr': '/root/autodl-tmp/Proj/code/logs/baseline_swin_unetr_sparse_amp_4_8/model_best.pth'
     }
     out_res = (128, 128, 128)
     tto_iters = 30
@@ -131,7 +131,7 @@ if __name__ == '__main__':
     logger.info("注意: 强制开启 Oracle 质心引导 (Pure Elastic Confrontation)。")
 
     if 'difnet' in QinForensicConfig.model_type:
-        model = DIF_Net(num_views=3, combine='attention').cuda()
+        model = DIF_Net(num_views=3, combine='mlp').cuda()
     elif QinForensicConfig.model_type == '3dunet':
         model = Baseline_3DUNet().cuda()
     elif QinForensicConfig.model_type == 'swin_unetr':
